@@ -1,0 +1,213 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Business {
+  id                   String    @id @default(cuid())
+  name                 String
+  address              String?
+  city                 String?
+  state                String?
+  pincode              String?
+  gstin                String?
+  pan                  String?
+  phone                String?
+  email                String?
+  logo_url             String?
+  currency             String    @default("INR")
+  financial_year_start Int       @default(4) // April
+  invoice_prefix       String    @default("INV")
+  invoice_next_number  Int       @default(1)
+  default_due_days     Int       @default(30)
+  default_notes        String?
+  default_terms        String?
+  default_tax_rate     Float     @default(18)
+  created_at           DateTime  @default(now())
+  updated_at           DateTime  @updatedAt
+
+  users        User[]
+  customers    Customer[]
+  products     Product[]
+  invoices     Invoice[]
+  payments     Payment[]
+  ledgerEntries LedgerEntry[]
+  expenses     Expense[]
+  subscription Subscription?
+}
+
+model User {
+  id            String   @id @default(cuid())
+  name          String
+  email         String   @unique
+  password_hash String
+  phone         String?
+  role          String   @default("owner") // owner | staff
+  business_id   String
+  refresh_token String?
+  created_at    DateTime @default(now())
+  updated_at    DateTime @updatedAt
+
+  business      Business  @relation(fields: [business_id], references: [id])
+  invoices      Invoice[] @relation("CreatedBy")
+}
+
+model Customer {
+  id              String    @id @default(cuid())
+  business_id     String
+  name            String
+  phone           String?
+  email           String?
+  address         String?
+  city            String?
+  state           String?
+  pincode         String?
+  gstin           String?
+  opening_balance Int       @default(0) // in paise
+  balance_type    String    @default("DR") // CR = customer owes you, DR = you owe customer
+  is_deleted      Boolean   @default(false)
+  created_at      DateTime  @default(now())
+  updated_at      DateTime  @updatedAt
+
+  business      Business      @relation(fields: [business_id], references: [id])
+  invoices      Invoice[]
+  payments      Payment[]
+  ledgerEntries LedgerEntry[]
+}
+
+model Product {
+  id               String   @id @default(cuid())
+  business_id      String
+  name             String
+  description      String?
+  unit             String   @default("pcs")
+  sale_price       Int      @default(0) // paise
+  purchase_price   Int      @default(0) // paise
+  tax_rate         Float    @default(18)
+  hsn_code         String?
+  track_inventory  Boolean  @default(false)
+  stock_quantity   Int      @default(0)
+  low_stock_alert  Int      @default(10)
+  is_active        Boolean  @default(true)
+  is_deleted       Boolean  @default(false)
+  created_at       DateTime @default(now())
+  updated_at       DateTime @updatedAt
+
+  business     Business      @relation(fields: [business_id], references: [id])
+  invoiceItems InvoiceItem[]
+}
+
+model Invoice {
+  id             String    @id @default(cuid())
+  business_id    String
+  customer_id    String
+  invoice_number String
+  invoice_date   DateTime  @default(now())
+  due_date       DateTime?
+  status         String    @default("draft") // draft|sent|paid|partial|cancelled
+  subtotal       Int       @default(0) // paise
+  discount_amount Int      @default(0)
+  tax_amount     Int       @default(0)
+  total_amount   Int       @default(0)
+  amount_paid    Int       @default(0)
+  balance_due    Int       @default(0)
+  notes          String?
+  terms          String?
+  created_by     String
+  is_deleted     Boolean   @default(false)
+  created_at     DateTime  @default(now())
+  updated_at     DateTime  @updatedAt
+
+  business  Business      @relation(fields: [business_id], references: [id])
+  customer  Customer      @relation(fields: [customer_id], references: [id])
+  creator   User          @relation("CreatedBy", fields: [created_by], references: [id])
+  items     InvoiceItem[]
+  payments  Payment[]
+
+  @@unique([business_id, invoice_number])
+}
+
+model InvoiceItem {
+  id               String   @id @default(cuid())
+  invoice_id       String
+  product_id       String?
+  description      String
+  quantity         Float    @default(1)
+  unit             String   @default("pcs")
+  rate             Int      @default(0) // paise
+  discount_percent Float    @default(0)
+  tax_rate         Float    @default(0)
+  tax_amount       Int      @default(0) // paise
+  amount           Int      @default(0) // paise
+  created_at       DateTime @default(now())
+
+  invoice  Invoice  @relation(fields: [invoice_id], references: [id])
+  product  Product? @relation(fields: [product_id], references: [id])
+}
+
+model Payment {
+  id               String   @id @default(cuid())
+  business_id      String
+  invoice_id       String
+  customer_id      String
+  amount           Int      // paise
+  payment_date     DateTime @default(now())
+  payment_mode     String   @default("cash") // cash|upi|card|cheque|bank|credit
+  reference_number String?
+  notes            String?
+  is_reversed      Boolean  @default(false)
+  created_at       DateTime @default(now())
+
+  business  Business @relation(fields: [business_id], references: [id])
+  invoice   Invoice  @relation(fields: [invoice_id], references: [id])
+  customer  Customer @relation(fields: [customer_id], references: [id])
+}
+
+model LedgerEntry {
+  id             String   @id @default(cuid())
+  business_id    String
+  customer_id    String
+  entry_type     String   // invoice|payment|adjustment
+  reference_id   String?  // free-form: invoice id, payment id, or customer id
+  reference_type String
+  debit          Int      @default(0) // paise
+  credit         Int      @default(0) // paise
+  balance        Int      @default(0) // paise
+  narration      String
+  entry_date     DateTime @default(now())
+  created_at     DateTime @default(now())
+
+  business  Business @relation(fields: [business_id], references: [id])
+  customer  Customer @relation(fields: [customer_id], references: [id])
+}
+
+model Expense {
+  id           String   @id @default(cuid())
+  business_id  String
+  category     String
+  amount       Int      // paise
+  payment_mode String   @default("cash")
+  description  String?
+  expense_date DateTime @default(now())
+  receipt_url  String?
+  created_at   DateTime @default(now())
+
+  business Business @relation(fields: [business_id], references: [id])
+}
+
+model Subscription {
+  id                      String   @id @default(cuid())
+  business_id             String   @unique
+  plan                    String   @default("free") // free|starter|pro
+  status                  String   @default("active") // active|expired|cancelled
+  razorpay_subscription_id String?
+  starts_at               DateTime @default(now())
+  expires_at              DateTime?
+  created_at              DateTime @default(now())
+
+  business Business @relation(fields: [business_id], references: [id])
+}
