@@ -42,6 +42,6 @@ app.use('/api/subscriptions', subscriptionsRoutes);
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`BillFlow server running on port ${PORT}`);
 });
