@@ -22,11 +22,11 @@ router.get('/business', async (req, res) => {
 // PUT /api/settings/business
 router.put('/business', async (req, res) => {
   try {
-    const { name, address, city, state, pincode, gstin, pan, phone, email } = req.body;
+    const { name, address, city, state, pincode, gstin, pan, phone, email, logo_url } = req.body;
     if (!name || !name.trim()) return res.status(400).json({ error: 'Business name is required' });
     const business = await prisma.business.update({
       where: { id: req.user.businessId },
-      data: { name: name.trim(), address, city, state, pincode, gstin, pan, phone, email },
+      data: { name: name.trim(), address, city, state, pincode, gstin, pan, phone, email, logo_url: logo_url || null },
     });
     return res.json(business);
   } catch (err) {
@@ -37,19 +37,29 @@ router.put('/business', async (req, res) => {
 // GET /api/settings/invoice
 router.get('/invoice', async (req, res) => {
   try {
-    const business = await prisma.business.findUnique({
-      where: { id: req.user.businessId },
-      select: {
-        invoice_prefix: true,
-        invoice_next_number: true,
-        default_due_days: true,
-        default_notes: true,
-        default_terms: true,
-        financial_year_start: true,
-      },
-    });
+    const [business, activeFY] = await Promise.all([
+      prisma.business.findUnique({
+        where: { id: req.user.businessId },
+        select: {
+          invoice_prefix: true,
+          purchase_prefix: true,
+          default_due_days: true,
+          default_notes: true,
+          default_terms: true,
+          financial_year_start: true,
+        },
+      }),
+      prisma.financialYear.findFirst({
+        where: { business_id: req.user.businessId, is_active: true },
+        select: { invoice_next_number: true, purchase_next_number: true },
+      }),
+    ]);
     if (!business) return res.status(404).json({ error: 'Business not found' });
-    return res.json(business);
+    return res.json({
+      ...business,
+      invoice_next_number: activeFY?.invoice_next_number ?? 1,
+      purchase_next_number: activeFY?.purchase_next_number ?? 1,
+    });
   } catch (err) {
     return res.status(500).json({ error: 'Failed to fetch invoice settings' });
   }
@@ -58,45 +68,77 @@ router.get('/invoice', async (req, res) => {
 // PUT /api/settings/invoice
 router.put('/invoice', async (req, res) => {
   try {
-    const { invoice_prefix, invoice_next_number, default_due_days, default_notes, default_terms, financial_year_start } = req.body;
+    const {
+      invoice_prefix, invoice_next_number,
+      purchase_prefix, purchase_next_number,
+      default_due_days, default_notes, default_terms, financial_year_start,
+    } = req.body;
 
-    const data = {};
+    const businessData = {};
+    const fyData = {};
+
     if (invoice_prefix !== undefined) {
       const prefix = String(invoice_prefix).trim().toUpperCase();
-      if (!prefix) return res.status(400).json({ error: 'Invoice prefix cannot be empty' });
-      data.invoice_prefix = prefix;
+      if (!prefix) return res.status(400).json({ error: 'Sale invoice prefix cannot be empty' });
+      businessData.invoice_prefix = prefix;
     }
     if (invoice_next_number !== undefined) {
       const num = parseInt(invoice_next_number);
-      if (isNaN(num) || num < 1) return res.status(400).json({ error: 'Next invoice number must be a positive integer' });
-      data.invoice_next_number = num;
+      if (isNaN(num) || num < 1) return res.status(400).json({ error: 'Next sale invoice number must be a positive integer' });
+      fyData.invoice_next_number = num;
+    }
+    if (purchase_prefix !== undefined) {
+      const prefix = String(purchase_prefix).trim().toUpperCase();
+      if (!prefix) return res.status(400).json({ error: 'Purchase invoice prefix cannot be empty' });
+      businessData.purchase_prefix = prefix;
+    }
+    if (purchase_next_number !== undefined) {
+      const num = parseInt(purchase_next_number);
+      if (isNaN(num) || num < 1) return res.status(400).json({ error: 'Next purchase invoice number must be a positive integer' });
+      fyData.purchase_next_number = num;
     }
     if (default_due_days !== undefined) {
       const days = parseInt(default_due_days);
       if (isNaN(days) || days < 0) return res.status(400).json({ error: 'Due days must be 0 or more' });
-      data.default_due_days = days;
+      businessData.default_due_days = days;
     }
     if (financial_year_start !== undefined) {
       const month = parseInt(financial_year_start);
       if (isNaN(month) || month < 1 || month > 12) return res.status(400).json({ error: 'Financial year start must be 1–12' });
-      data.financial_year_start = month;
+      businessData.financial_year_start = month;
     }
-    if (default_notes !== undefined) data.default_notes = default_notes || null;
-    if (default_terms !== undefined) data.default_terms = default_terms || null;
+    if (default_notes !== undefined) businessData.default_notes = default_notes || null;
+    if (default_terms !== undefined) businessData.default_terms = default_terms || null;
 
-    const business = await prisma.business.update({
-      where: { id: req.user.businessId },
-      data,
-      select: {
-        invoice_prefix: true,
-        invoice_next_number: true,
-        default_due_days: true,
-        default_notes: true,
-        default_terms: true,
-        financial_year_start: true,
-      },
+    // Update business fields and active FY counters in parallel
+    const activeFY = await prisma.financialYear.findFirst({
+      where: { business_id: req.user.businessId, is_active: true },
+      select: { id: true, invoice_next_number: true, purchase_next_number: true },
     });
-    return res.json(business);
+
+    const [business] = await Promise.all([
+      prisma.business.update({
+        where: { id: req.user.businessId },
+        data: businessData,
+        select: {
+          invoice_prefix: true,
+          purchase_prefix: true,
+          default_due_days: true,
+          default_notes: true,
+          default_terms: true,
+          financial_year_start: true,
+        },
+      }),
+      activeFY && Object.keys(fyData).length > 0
+        ? prisma.financialYear.update({ where: { id: activeFY.id }, data: fyData })
+        : Promise.resolve(null),
+    ]);
+
+    return res.json({
+      ...business,
+      invoice_next_number: activeFY ? (fyData.invoice_next_number ?? activeFY.invoice_next_number) : 1,
+      purchase_next_number: activeFY ? (fyData.purchase_next_number ?? activeFY.purchase_next_number) : 1,
+    });
   } catch (err) {
     return res.status(500).json({ error: 'Failed to update invoice settings' });
   }

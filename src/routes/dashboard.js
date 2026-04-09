@@ -2,13 +2,15 @@ const express = require('express');
 const router = express.Router();
 const prisma = require('../utils/prisma');
 const { authenticateToken } = require('../middleware/auth');
+const { attachFinancialYear } = require('../middleware/financialYear');
 
 router.use(authenticateToken);
 
 // GET /api/dashboard/summary
-router.get('/summary', async (req, res) => {
+router.get('/summary', attachFinancialYear, async (req, res) => {
   try {
     const businessId = req.user.businessId;
+    const fyFilter = req.financialYear ? { financial_year_id: req.financialYear.id } : {};
     const now = new Date();
 
     // Today: midnight to now
@@ -21,16 +23,21 @@ router.get('/summary', async (req, res) => {
     // Run all queries in parallel
     const [
       todaySalesResult,
+      todayPurchasesResult,
       invoicesTodayCount,
       outstandingResult,
+      totalPayableResult,
       monthCollectedResult,
       recentInvoices,
       topCustomers,
+      topSuppliers,
     ] = await Promise.all([
-      // Today's sales total (finalized invoices created today)
+      // Today's sales total (SALE invoices created today)
       prisma.invoice.aggregate({
         where: {
           business_id: businessId,
+          ...fyFilter,
+          voucher_type: 'SALE',
           status: { in: ['sent', 'paid', 'partial'] },
           invoice_date: { gte: todayStart, lt: todayEnd },
           is_deleted: false,
@@ -38,49 +45,82 @@ router.get('/summary', async (req, res) => {
         _sum: { total_amount: true },
       }),
 
-      // Count of invoices today
+      // Today's purchases total (PURCHASE invoices created today)
+      prisma.invoice.aggregate({
+        where: {
+          business_id: businessId,
+          ...fyFilter,
+          voucher_type: 'PURCHASE',
+          status: { in: ['sent', 'paid', 'partial'] },
+          invoice_date: { gte: todayStart, lt: todayEnd },
+          is_deleted: false,
+        },
+        _sum: { total_amount: true },
+      }),
+
+      // Count of invoices today (sales only)
       prisma.invoice.count({
         where: {
           business_id: businessId,
+          ...fyFilter,
+          voucher_type: 'SALE',
           invoice_date: { gte: todayStart, lt: todayEnd },
           status: { not: 'cancelled' },
           is_deleted: false,
         },
       }),
 
-      // Total outstanding (balance_due across all unpaid invoices)
+      // Total outstanding receivable (SALE balance due)
       prisma.invoice.aggregate({
         where: {
           business_id: businessId,
+          ...fyFilter,
+          voucher_type: 'SALE',
           status: { in: ['sent', 'partial'] },
           is_deleted: false,
         },
         _sum: { balance_due: true },
       }),
 
-      // Total received this month (payments)
+      // Total payable to suppliers (PURCHASE balance due)
+      prisma.invoice.aggregate({
+        where: {
+          business_id: businessId,
+          ...fyFilter,
+          voucher_type: 'PURCHASE',
+          status: { in: ['sent', 'partial'] },
+          is_deleted: false,
+        },
+        _sum: { balance_due: true },
+      }),
+
+      // Total received this month (customer payments)
       prisma.payment.aggregate({
         where: {
           business_id: businessId,
+          ...fyFilter,
+          party_type: 'CUSTOMER',
           payment_date: { gte: monthStart },
           is_reversed: false,
         },
         _sum: { amount: true },
       }),
 
-      // Recent 5 invoices
+      // Recent 5 SALE invoices
       prisma.invoice.findMany({
-        where: { business_id: businessId, is_deleted: false },
+        where: { business_id: businessId, ...fyFilter, is_deleted: false },
         orderBy: { created_at: 'desc' },
-        take: 5,
+        take: 8,
         select: {
           id: true,
           invoice_number: true,
           invoice_date: true,
+          voucher_type: true,
           status: true,
           total_amount: true,
           balance_due: true,
           customer: { select: { name: true } },
+          supplier: { select: { name: true } },
         },
       }),
 
@@ -89,6 +129,23 @@ router.get('/summary', async (req, res) => {
         by: ['customer_id'],
         where: {
           business_id: businessId,
+          ...fyFilter,
+          voucher_type: 'SALE',
+          status: { in: ['sent', 'partial'] },
+          is_deleted: false,
+        },
+        _sum: { balance_due: true },
+        orderBy: { _sum: { balance_due: 'desc' } },
+        take: 5,
+      }),
+
+      // Top 5 suppliers by outstanding payable
+      prisma.invoice.groupBy({
+        by: ['supplier_id'],
+        where: {
+          business_id: businessId,
+          ...fyFilter,
+          voucher_type: 'PURCHASE',
           status: { in: ['sent', 'partial'] },
           is_deleted: false,
         },
@@ -98,26 +155,42 @@ router.get('/summary', async (req, res) => {
       }),
     ]);
 
-    // Enrich top customers with names
-    const customerIds = topCustomers.map((c) => c.customer_id);
-    const customers = await prisma.customer.findMany({
-      where: { id: { in: customerIds } },
-      select: { id: true, name: true, phone: true },
-    });
+    // Enrich top customers and suppliers with names in parallel
+    const customerIds = topCustomers.map((c) => c.customer_id).filter(Boolean);
+    const supplierIds = topSuppliers.map((s) => s.supplier_id).filter(Boolean);
+
+    const [customers, suppliers] = await Promise.all([
+      customerIds.length
+        ? prisma.customer.findMany({ where: { id: { in: customerIds } }, select: { id: true, name: true, phone: true } })
+        : [],
+      supplierIds.length
+        ? prisma.supplier.findMany({ where: { id: { in: supplierIds } }, select: { id: true, name: true, phone: true } })
+        : [],
+    ]);
+
     const customerMap = Object.fromEntries(customers.map((c) => [c.id, c]));
+    const supplierMap = Object.fromEntries(suppliers.map((s) => [s.id, s]));
 
     const enrichedTopCustomers = topCustomers.map((tc) => ({
       customer: customerMap[tc.customer_id] || { id: tc.customer_id, name: 'Unknown' },
       outstanding: tc._sum.balance_due || 0,
     }));
 
+    const enrichedTopSuppliers = topSuppliers.map((ts) => ({
+      supplier: supplierMap[ts.supplier_id] || { id: ts.supplier_id, name: 'Unknown' },
+      payable: ts._sum.balance_due || 0,
+    }));
+
     return res.json({
       todaySales: todaySalesResult._sum.total_amount || 0,
+      todayPurchases: todayPurchasesResult._sum.total_amount || 0,
       invoicesToday: invoicesTodayCount,
       totalOutstanding: outstandingResult._sum.balance_due || 0,
+      totalPayable: totalPayableResult._sum.balance_due || 0,
       monthCollected: monthCollectedResult._sum.amount || 0,
       recentInvoices,
       topCustomers: enrichedTopCustomers,
+      topSuppliers: enrichedTopSuppliers,
     });
   } catch (err) {
     console.error('Dashboard error:', err);

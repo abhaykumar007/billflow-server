@@ -2,11 +2,10 @@ const express = require('express');
 const router = express.Router();
 const prisma = require('../utils/prisma');
 const { authenticateToken } = require('../middleware/auth');
-const { attachFinancialYear } = require('../middleware/financialYear');
 
 router.use(authenticateToken);
 
-// GET /api/customers — list with search + pagination
+// GET /api/suppliers — list with search + pagination
 router.get('/', async (req, res) => {
   try {
     const businessId = req.user.businessId;
@@ -27,8 +26,8 @@ router.get('/', async (req, res) => {
         : {}),
     };
 
-    const [customers, total] = await Promise.all([
-      prisma.customer.findMany({
+    const [suppliers, total] = await Promise.all([
+      prisma.supplier.findMany({
         where,
         orderBy: { name: 'asc' },
         skip,
@@ -41,105 +40,73 @@ router.get('/', async (req, res) => {
           city: true,
           state: true,
           gstin: true,
+          pan: true,
           opening_balance: true,
           balance_type: true,
           created_at: true,
-          _count: { select: { invoices: true } },
         },
       }),
-      prisma.customer.count({ where }),
+      prisma.supplier.count({ where }),
     ]);
 
-    // Compute outstanding balance per customer from invoices
-    const customerIds = customers.map((c) => c.id);
-    const outstandingData = await prisma.invoice.groupBy({
-      by: ['customer_id'],
-      where: {
-        business_id: businessId,
-        customer_id: { in: customerIds },
-        status: { in: ['sent', 'partial'] },
-        is_deleted: false,
-      },
-      _sum: { balance_due: true },
-    });
-    const outstandingMap = Object.fromEntries(
-      outstandingData.map((o) => [o.customer_id, o._sum.balance_due || 0])
-    );
-
-    const enriched = customers.map((c) => ({
-      ...c,
-      outstanding: outstandingMap[c.id] || 0,
-    }));
-
-    return res.json({ customers: enriched, total, page: parseInt(page), limit: parseInt(limit) });
+    return res.json({ suppliers, total, page: parseInt(page), limit: parseInt(limit) });
   } catch (err) {
-    console.error('List customers error:', err);
-    return res.status(500).json({ error: 'Failed to fetch customers' });
+    console.error('List suppliers error:', err);
+    return res.status(500).json({ error: 'Failed to fetch suppliers' });
   }
 });
 
-// GET /api/customers/:id — single customer with balance summary
+// GET /api/suppliers/:id — single supplier with balance summary
 router.get('/:id', async (req, res) => {
   try {
     const businessId = req.user.businessId;
-    const customer = await prisma.customer.findFirst({
+    const supplier = await prisma.supplier.findFirst({
       where: { id: req.params.id, business_id: businessId, is_deleted: false },
     });
-    if (!customer) return res.status(404).json({ error: 'Customer not found' });
+    if (!supplier) return res.status(404).json({ error: 'Supplier not found' });
 
-    const [invoiceSummary, totalPaid] = await Promise.all([
-      prisma.invoice.aggregate({
-        where: {
-          customer_id: customer.id,
-          business_id: businessId,
-          is_deleted: false,
-          status: { not: 'cancelled' },
-        },
-        _sum: { total_amount: true, amount_paid: true, balance_due: true },
-        _count: { id: true },
-      }),
-      prisma.payment.aggregate({
-        where: {
-          customer_id: customer.id,
-          business_id: businessId,
-          is_reversed: false,
-        },
-        _sum: { amount: true },
-      }),
-    ]);
+    // Aggregate from supplier ledger entries
+    const ledgerAgg = await prisma.supplierLedgerEntry.aggregate({
+      where: { supplier_id: supplier.id, business_id: businessId },
+      _sum: { debit: true, credit: true },
+    });
+
+    const totalDebit = ledgerAgg._sum.debit || 0;
+    const totalCredit = ledgerAgg._sum.credit || 0;
+    // For suppliers: CR means you owe them (credit > debit = payable)
+    const payable = totalCredit - totalDebit;
 
     return res.json({
-      ...customer,
+      ...supplier,
       summary: {
-        totalBilled: invoiceSummary._sum.total_amount || 0,
-        totalPaid: totalPaid._sum.amount || 0,
-        outstanding: invoiceSummary._sum.balance_due || 0,
-        invoiceCount: invoiceSummary._count.id || 0,
+        totalDebit,
+        totalCredit,
+        payable: Math.max(0, payable),
+        balance: payable,
       },
     });
   } catch (err) {
-    console.error('Get customer error:', err);
-    return res.status(500).json({ error: 'Failed to fetch customer' });
+    console.error('Get supplier error:', err);
+    return res.status(500).json({ error: 'Failed to fetch supplier' });
   }
 });
 
-// GET /api/customers/:id/ledger — transaction history (FY-scoped)
-router.get('/:id/ledger', attachFinancialYear, async (req, res) => {
+// GET /api/suppliers/:id/ledger — transaction history
+router.get('/:id/ledger', async (req, res) => {
   try {
     const businessId = req.user.businessId;
     const { from, to, page = 1, limit = 50 } = req.query;
     const skip = (parseInt(page) - 1) * parseInt(limit);
 
-    const customer = await prisma.customer.findFirst({
+    const supplier = await prisma.supplier.findFirst({
       where: { id: req.params.id, business_id: businessId, is_deleted: false },
       select: { id: true },
     });
-    if (!customer) return res.status(404).json({ error: 'Customer not found' });
+    if (!supplier) return res.status(404).json({ error: 'Supplier not found' });
 
     const where = {
-      customer_id: req.params.id,
+      supplier_id: req.params.id,
       business_id: businessId,
-      ...(req.financialYear ? { financial_year_id: req.financialYear.id } : {}),
       ...(from || to
         ? {
             entry_date: {
@@ -151,65 +118,69 @@ router.get('/:id/ledger', attachFinancialYear, async (req, res) => {
     };
 
     const [entries, total] = await Promise.all([
-      prisma.ledgerEntry.findMany({
+      prisma.supplierLedgerEntry.findMany({
         where,
         orderBy: { entry_date: 'asc' },
         skip,
         take: parseInt(limit),
       }),
-      prisma.ledgerEntry.count({ where }),
+      prisma.supplierLedgerEntry.count({ where }),
     ]);
 
     return res.json({ entries, total, page: parseInt(page), limit: parseInt(limit) });
   } catch (err) {
-    console.error('Ledger error:', err);
+    console.error('Supplier ledger error:', err);
     return res.status(500).json({ error: 'Failed to fetch ledger' });
   }
 });
 
-// GET /api/customers/:id/invoices — invoices for a customer
+// GET /api/suppliers/:id/invoices — purchase invoices
 router.get('/:id/invoices', async (req, res) => {
   try {
     const businessId = req.user.businessId;
-    const { page = 1, limit = 20 } = req.query;
+    const { limit = 50, page = 1 } = req.query;
     const skip = (parseInt(page) - 1) * parseInt(limit);
 
-    const customer = await prisma.customer.findFirst({
+    const supplier = await prisma.supplier.findFirst({
       where: { id: req.params.id, business_id: businessId, is_deleted: false },
       select: { id: true },
     });
-    if (!customer) return res.status(404).json({ error: 'Customer not found' });
+    if (!supplier) return res.status(404).json({ error: 'Supplier not found' });
+
+    const where = {
+      business_id: businessId,
+      supplier_id: supplier.id,
+      voucher_type: { in: ['PURCHASE', 'PURCHASE_RETURN'] },
+      is_deleted: false,
+    };
 
     const [invoices, total] = await Promise.all([
       prisma.invoice.findMany({
-        where: { customer_id: req.params.id, business_id: businessId, is_deleted: false },
+        where,
         orderBy: { invoice_date: 'desc' },
         skip,
         take: parseInt(limit),
         select: {
           id: true,
           invoice_number: true,
+          voucher_type: true,
           invoice_date: true,
-          due_date: true,
           status: true,
           total_amount: true,
-          amount_paid: true,
           balance_due: true,
         },
       }),
-      prisma.invoice.count({
-        where: { customer_id: req.params.id, business_id: businessId, is_deleted: false },
-      }),
+      prisma.invoice.count({ where }),
     ]);
 
     return res.json({ invoices, total, page: parseInt(page), limit: parseInt(limit) });
   } catch (err) {
-    console.error('Customer invoices error:', err);
+    console.error('Supplier invoices error:', err);
     return res.status(500).json({ error: 'Failed to fetch invoices' });
   }
 });
 
-// POST /api/customers — create
+// POST /api/suppliers — create
 router.post('/', async (req, res) => {
   try {
     const businessId = req.user.businessId;
@@ -222,13 +193,14 @@ router.post('/', async (req, res) => {
       state,
       pincode,
       gstin,
+      pan,
       opening_balance = 0,
-      balance_type = 'DR',
+      balance_type = 'CR',
     } = req.body;
 
     if (!name) return res.status(400).json({ error: 'Name is required' });
 
-    const customer = await prisma.customer.create({
+    const supplier = await prisma.supplier.create({
       data: {
         business_id: businessId,
         name: name.trim(),
@@ -239,7 +211,8 @@ router.post('/', async (req, res) => {
         state: state?.trim() || null,
         pincode: pincode?.trim() || null,
         gstin: gstin?.trim() || null,
-        opening_balance: Math.round(opening_balance * 100), // rupees → paise
+        pan: pan?.trim() || null,
+        opening_balance: Math.round((parseFloat(opening_balance) || 0) * 100),
         balance_type,
       },
     });
@@ -247,13 +220,14 @@ router.post('/', async (req, res) => {
     // Create opening balance ledger entry if non-zero
     const obAmount = parseFloat(opening_balance) || 0;
     if (obAmount !== 0) {
-      await prisma.ledgerEntry.create({
+      await prisma.supplierLedgerEntry.create({
         data: {
           business_id: businessId,
-          customer_id: customer.id,
+          supplier_id: supplier.id,
           entry_type: 'adjustment',
-          reference_id: customer.id,
+          reference_id: supplier.id,
           reference_type: 'opening_balance',
+          // CR balance_type means you owe them → credit entry
           debit: balance_type === 'DR' ? Math.round(obAmount * 100) : 0,
           credit: balance_type === 'CR' ? Math.round(obAmount * 100) : 0,
           balance: balance_type === 'CR' ? -Math.round(obAmount * 100) : Math.round(obAmount * 100),
@@ -263,39 +237,30 @@ router.post('/', async (req, res) => {
       });
     }
 
-    return res.status(201).json(customer);
+    return res.status(201).json(supplier);
   } catch (err) {
-    console.error('Create customer error:', err);
-    const msg = process.env.NODE_ENV === 'development' ? err.message : 'Failed to create customer';
+    console.error('Create supplier error:', err);
+    const msg = process.env.NODE_ENV === 'development' ? err.message : 'Failed to create supplier';
     return res.status(500).json({ error: msg });
   }
 });
 
-// PUT /api/customers/:id — update
+// PUT /api/suppliers/:id — update
 router.put('/:id', async (req, res) => {
   try {
     const businessId = req.user.businessId;
-    const existing = await prisma.customer.findFirst({
+    const existing = await prisma.supplier.findFirst({
       where: { id: req.params.id, business_id: businessId, is_deleted: false },
     });
-    if (!existing) return res.status(404).json({ error: 'Customer not found' });
+    if (!existing) return res.status(404).json({ error: 'Supplier not found' });
 
-    const {
-      name,
-      phone,
-      email,
-      address,
-      city,
-      state,
-      pincode,
-      gstin,
-    } = req.body;
+    const { name, phone, email, address, city, state, pincode, gstin, pan } = req.body;
 
     if (name !== undefined && !name.trim()) {
       return res.status(400).json({ error: 'Name cannot be empty' });
     }
 
-    const updated = await prisma.customer.update({
+    const updated = await prisma.supplier.update({
       where: { id: req.params.id },
       data: {
         ...(name !== undefined && { name: name.trim() }),
@@ -306,49 +271,45 @@ router.put('/:id', async (req, res) => {
         ...(state !== undefined && { state: state.trim() || null }),
         ...(pincode !== undefined && { pincode: pincode.trim() || null }),
         ...(gstin !== undefined && { gstin: gstin.trim() || null }),
+        ...(pan !== undefined && { pan: pan.trim() || null }),
       },
     });
 
     return res.json(updated);
   } catch (err) {
-    console.error('Update customer error:', err);
-    return res.status(500).json({ error: 'Failed to update customer' });
+    console.error('Update supplier error:', err);
+    return res.status(500).json({ error: 'Failed to update supplier' });
   }
 });
 
-// DELETE /api/customers/:id — soft delete
+// DELETE /api/suppliers/:id — soft delete
 router.delete('/:id', async (req, res) => {
   try {
     const businessId = req.user.businessId;
-    const customer = await prisma.customer.findFirst({
+    const supplier = await prisma.supplier.findFirst({
       where: { id: req.params.id, business_id: businessId, is_deleted: false },
     });
-    if (!customer) return res.status(404).json({ error: 'Customer not found' });
+    if (!supplier) return res.status(404).json({ error: 'Supplier not found' });
 
-    // Block delete if customer has outstanding balance (SALE invoices only)
-    const outstanding = await prisma.invoice.aggregate({
-      where: {
-        customer_id: req.params.id,
-        business_id: businessId,
-        voucher_type: 'SALE',
-        status: { in: ['sent', 'partial'] },
-        is_deleted: false,
-      },
-      _sum: { balance_due: true },
+    // Block delete if supplier has outstanding payable
+    const ledgerAgg = await prisma.supplierLedgerEntry.aggregate({
+      where: { supplier_id: req.params.id, business_id: businessId },
+      _sum: { debit: true, credit: true },
     });
-    if ((outstanding._sum.balance_due || 0) > 0) {
-      return res.status(400).json({ error: 'Cannot delete customer with outstanding dues' });
+    const payable = (ledgerAgg._sum.credit || 0) - (ledgerAgg._sum.debit || 0);
+    if (payable > 0) {
+      return res.status(400).json({ error: 'Cannot delete supplier with outstanding payable' });
     }
 
-    await prisma.customer.update({
+    await prisma.supplier.update({
       where: { id: req.params.id },
       data: { is_deleted: true },
     });
 
     return res.json({ success: true });
   } catch (err) {
-    console.error('Delete customer error:', err);
-    return res.status(500).json({ error: 'Failed to delete customer' });
+    console.error('Delete supplier error:', err);
+    return res.status(500).json({ error: 'Failed to delete supplier' });
   }
 });
 

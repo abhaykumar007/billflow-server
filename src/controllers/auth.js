@@ -2,8 +2,8 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const prisma = require('../utils/prisma');
 
-const ACCESS_TOKEN_EXPIRY = '15m';
-const REFRESH_TOKEN_EXPIRY = '7d';
+const ACCESS_TOKEN_EXPIRY = '24h';
+const REFRESH_TOKEN_EXPIRY = '90d';
 
 function generateTokens(payload) {
   const accessToken = jwt.sign(payload, process.env.JWT_SECRET, {
@@ -15,10 +15,52 @@ function generateTokens(payload) {
   return { accessToken, refreshToken };
 }
 
+// Determine the current financial year start year based on today's date
+// Indian FY: April 1 → March 31
+function currentFYStartYear() {
+  const now = new Date();
+  const month = now.getMonth() + 1; // 1-12
+  return month >= 4 ? now.getFullYear() : now.getFullYear() - 1;
+}
+
+function buildFYData(startYear) {
+  const start = new Date(startYear, 3, 1);
+  const end   = new Date(startYear + 1, 2, 31, 23, 59, 59, 999);
+  const shortEnd = String(startYear + 1).slice(2);
+  const label = `FY ${startYear}-${shortEnd}`;
+  return { label, start_date: start, end_date: end };
+}
+
+function formatBusinessResponse(business, activeFY) {
+  return {
+    id: business.id,
+    name: business.name,
+    address: business.address,
+    city: business.city,
+    state: business.state,
+    pincode: business.pincode,
+    gstin: business.gstin,
+    pan: business.pan,
+    phone: business.phone,
+    email: business.email,
+    logo_url: business.logo_url,
+    currency: business.currency,
+    invoice_prefix: business.invoice_prefix,
+    financial_year_start: business.financial_year_start,
+    default_due_days: business.default_due_days,
+    default_notes: business.default_notes,
+    default_terms: business.default_terms,
+    subscription: business.subscription
+      ? { plan: business.subscription.plan, status: business.subscription.status }
+      : { plan: 'free', status: 'active' },
+    active_financial_year: activeFY || null,
+  };
+}
+
 // POST /api/auth/register
 async function register(req, res) {
   try {
-    const { name, email, password, phone, business } = req.body;
+    const { name, email, password, phone, business, financial_year_start } = req.body;
 
     if (!name || !email || !password || !business?.name) {
       return res.status(400).json({ error: 'name, email, password, and business.name are required' });
@@ -31,7 +73,12 @@ async function register(req, res) {
 
     const password_hash = await bcrypt.hash(password, 12);
 
-    // Create business + user + free subscription in a transaction
+    // Determine which FY to create (from onboarding choice or auto-detect current)
+    const fyStartYear = financial_year_start
+      ? parseInt(financial_year_start, 10)
+      : currentFYStartYear();
+    const { label, start_date, end_date } = buildFYData(fyStartYear);
+
     const result = await prisma.$transaction(async (tx) => {
       const newBusiness = await tx.business.create({
         data: {
@@ -58,15 +105,20 @@ async function register(req, res) {
       });
 
       await tx.subscription.create({
+        data: { business_id: newBusiness.id, plan: 'free', status: 'active' },
+      });
+
+      const fy = await tx.financialYear.create({
         data: {
           business_id: newBusiness.id,
-          plan: 'free',
-          status: 'active',
+          label,
+          start_date,
+          end_date,
+          is_active: true,
         },
       });
 
-      // Update business owner reference isn't needed since User has business_id
-      return { user: newUser, business: newBusiness };
+      return { user: newUser, business: newBusiness, fy };
     });
 
     const { accessToken, refreshToken } = generateTokens({
@@ -75,7 +127,6 @@ async function register(req, res) {
       role: result.user.role,
     });
 
-    // Store refresh token in DB
     await prisma.user.update({
       where: { id: result.user.id },
       data: { refresh_token: refreshToken },
@@ -85,7 +136,7 @@ async function register(req, res) {
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
       sameSite: 'strict',
-      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+      maxAge: 90 * 24 * 60 * 60 * 1000,
     });
 
     return res.status(201).json({
@@ -95,22 +146,10 @@ async function register(req, res) {
         name: result.user.name,
         email: result.user.email,
         role: result.user.role,
-        business: {
-          id: result.business.id,
-          name: result.business.name,
-          address: result.business.address,
-          city: result.business.city,
-          state: result.business.state,
-          pincode: result.business.pincode,
-          gstin: result.business.gstin,
-          phone: result.business.phone,
-          email: result.business.email,
-          invoice_prefix: result.business.invoice_prefix,
-          financial_year_start: result.business.financial_year_start,
-          default_due_days: result.business.default_due_days,
-          default_notes: result.business.default_notes,
-          default_terms: result.business.default_terms,
-        },
+        business: formatBusinessResponse(
+          { ...result.business, subscription: { plan: 'free', status: 'active' } },
+          result.fy
+        ),
       },
     });
   } catch (err) {
@@ -133,7 +172,17 @@ async function login(req, res) {
 
     const user = await prisma.user.findUnique({
       where: { email },
-      include: { business: true },
+      include: {
+        business: {
+          include: {
+            subscription: true,
+            financialYears: {
+              where: { is_active: true },
+              take: 1,
+            },
+          },
+        },
+      },
     });
 
     if (!user) {
@@ -160,8 +209,10 @@ async function login(req, res) {
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
       sameSite: 'strict',
-      maxAge: 7 * 24 * 60 * 60 * 1000,
+      maxAge: 90 * 24 * 60 * 60 * 1000,
     });
+
+    const activeFY = user.business.financialYears[0] || null;
 
     return res.json({
       accessToken,
@@ -170,22 +221,7 @@ async function login(req, res) {
         name: user.name,
         email: user.email,
         role: user.role,
-        business: {
-          id: user.business.id,
-          name: user.business.name,
-          address: user.business.address,
-          city: user.business.city,
-          state: user.business.state,
-          pincode: user.business.pincode,
-          gstin: user.business.gstin,
-          phone: user.business.phone,
-          email: user.business.email,
-          invoice_prefix: user.business.invoice_prefix,
-          financial_year_start: user.business.financial_year_start,
-          default_due_days: user.business.default_due_days,
-          default_notes: user.business.default_notes,
-          default_terms: user.business.default_terms,
-        },
+        business: formatBusinessResponse(user.business, activeFY),
       },
     });
   } catch (err) {
@@ -230,7 +266,7 @@ async function refresh(req, res) {
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
       sameSite: 'strict',
-      maxAge: 7 * 24 * 60 * 60 * 1000,
+      maxAge: 90 * 24 * 60 * 60 * 1000,
     });
 
     return res.json({ accessToken });
@@ -245,7 +281,6 @@ async function logout(req, res) {
   try {
     const token = req.cookies.refreshToken;
     if (token) {
-      // Clear refresh token from DB
       await prisma.user.updateMany({
         where: { refresh_token: token },
         data: { refresh_token: null },
@@ -266,7 +301,13 @@ async function me(req, res) {
       where: { id: req.user.userId },
       include: {
         business: {
-          include: { subscription: true },
+          include: {
+            subscription: true,
+            financialYears: {
+              where: { is_active: true },
+              take: 1,
+            },
+          },
         },
       },
     });
@@ -275,34 +316,15 @@ async function me(req, res) {
       return res.status(404).json({ error: 'User not found' });
     }
 
+    const activeFY = user.business.financialYears[0] || null;
+
     return res.json({
       id: user.id,
       name: user.name,
       email: user.email,
       phone: user.phone,
       role: user.role,
-      business: {
-        id: user.business.id,
-        name: user.business.name,
-        address: user.business.address,
-        city: user.business.city,
-        state: user.business.state,
-        pincode: user.business.pincode,
-        gstin: user.business.gstin,
-        pan: user.business.pan,
-        phone: user.business.phone,
-        email: user.business.email,
-        logo_url: user.business.logo_url,
-        currency: user.business.currency,
-        invoice_prefix: user.business.invoice_prefix,
-        financial_year_start: user.business.financial_year_start,
-        default_due_days: user.business.default_due_days,
-        default_notes: user.business.default_notes,
-        default_terms: user.business.default_terms,
-        subscription: user.business.subscription
-          ? { plan: user.business.subscription.plan, status: user.business.subscription.status }
-          : { plan: 'free', status: 'active' },
-      },
+      business: formatBusinessResponse(user.business, activeFY),
     });
   } catch (err) {
     console.error('Me error:', err);

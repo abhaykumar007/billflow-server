@@ -46,7 +46,7 @@ router.get('/current', async (req, res) => {
       plan: isExpired ? 'free' : plan,
       status: isExpired ? 'expired' : (sub?.status || 'active'),
       expires_at: sub?.expires_at || null,
-      razorpay_subscription_id: sub?.razorpay_subscription_id || null,
+      razorpay_payment_id: sub?.razorpay_payment_id || null,
       usage: {
         invoices_this_month: invoicesThisMonth,
         invoice_limit: plan === 'free' && !isExpired ? 50 : null,
@@ -126,7 +126,7 @@ router.post('/verify', async (req, res) => {
       update: {
         plan,
         status: 'active',
-        razorpay_subscription_id: payment_id,
+        razorpay_payment_id: payment_id,
         starts_at: new Date(),
         expires_at: expiresAt,
       },
@@ -134,7 +134,7 @@ router.post('/verify', async (req, res) => {
         business_id: req.user.businessId,
         plan,
         status: 'active',
-        razorpay_subscription_id: payment_id,
+        razorpay_payment_id: payment_id,
         starts_at: new Date(),
         expires_at: expiresAt,
       },

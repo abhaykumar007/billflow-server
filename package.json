@@ -7,9 +7,9 @@
     "dev": "nodemon src/index.js",
     "build": "node_modules/.bin/prisma generate",
     "start": "node_modules/.bin/prisma migrate deploy && node src/index.js",
-    "prisma:migrate": "npx prisma migrate dev",
-    "prisma:generate": "npx prisma generate",
-    "prisma:studio": "npx prisma studio"
+    "prisma:migrate": "dotenv -e .env.development -- prisma migrate dev",
+    "prisma:generate": "dotenv -e .env.development -- prisma generate",
+    "prisma:studio": "dotenv -e .env.development -- prisma studio"
   },
   "keywords": [],
   "author": "",
@@ -27,6 +27,7 @@
     "razorpay": "^2.9.6"
   },
   "devDependencies": {
+    "dotenv-cli": "^11.0.0",
     "nodemon": "^3.1.14"
   }
 }
