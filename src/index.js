@@ -11,11 +11,14 @@ const dashboardRoutes = require('./routes/dashboard');
 const customersRoutes = require('./routes/customers');
 const suppliersRoutes = require('./routes/suppliers');
 const productsRoutes = require('./routes/products');
+const productCategoriesRoutes = require('./routes/product-categories');
 const invoicesRoutes = require('./routes/invoices');
 const paymentsRoutes = require('./routes/payments');
 const ledgerRoutes = require('./routes/ledger');
 const reportsRoutes = require('./routes/reports');
 const expensesRoutes = require('./routes/expenses');
+const bankAccountsRoutes = require('./routes/bank-accounts');
+const fundTransfersRoutes = require('./routes/fund-transfers');
 const subscriptionsRoutes = require('./routes/subscriptions');
 const { handleWebhook } = require('./routes/subscriptions');
 
@@ -46,9 +49,12 @@ app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/customers', customersRoutes);
 app.use('/api/suppliers', suppliersRoutes);
 app.use('/api/products', productsRoutes);
+app.use('/api/product-categories', productCategoriesRoutes);
 app.use('/api/invoices', invoicesRoutes);
 app.use('/api/payments', paymentsRoutes);
 app.use('/api/expenses', expensesRoutes);
+app.use('/api/bank-accounts', bankAccountsRoutes);
+app.use('/api/fund-transfers', fundTransfersRoutes);
 app.use('/api/ledger', ledgerRoutes);
 app.use('/api/reports', reportsRoutes);
 // Webhook must be before the auth-protected subscriptions router

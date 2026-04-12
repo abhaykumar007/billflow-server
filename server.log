@@ -1,0 +1,2 @@
+[dotenv@17.3.1] injecting env (8) from .env.development -- tip: ⚙️  write to custom object with { processEnv: myObject }
+BillFlow server running on port 5000

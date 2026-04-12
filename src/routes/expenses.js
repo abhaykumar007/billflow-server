@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const prisma = require('../utils/prisma');
 const { authenticateToken } = require('../middleware/auth');
-const { attachFinancialYear } = require('../middleware/financialYear');
+const { attachFinancialYear, requireUnlockedFY, enforceOpenYear } = require('../middleware/financialYear');
 
 router.use(authenticateToken);
 
@@ -40,7 +40,7 @@ router.get('/', attachFinancialYear, async (req, res) => {
 });
 
 // POST /api/expenses
-router.post('/', attachFinancialYear, async (req, res) => {
+router.post('/', attachFinancialYear, enforceOpenYear, requireUnlockedFY, async (req, res) => {
   const { category, amount, payment_mode, description, expense_date, receipt_url } = req.body;
   const businessId = req.user.businessId;
 
@@ -78,6 +78,10 @@ router.put('/:id', async (req, res) => {
       where: { id: req.params.id, business_id: businessId },
     });
     if (!existing) return res.status(404).json({ error: 'Expense not found' });
+    if (existing.financial_year_id) {
+      const fy = await prisma.financialYear.findUnique({ where: { id: existing.financial_year_id }, select: { is_locked: true } });
+      if (fy?.is_locked) return res.status(423).json({ error: 'This financial year is locked. No changes are allowed.', code: 'FY_LOCKED' });
+    }
 
     const data = {};
     if (category !== undefined) data.category = category.trim();
@@ -103,6 +107,10 @@ router.delete('/:id', async (req, res) => {
       where: { id: req.params.id, business_id: businessId, is_deleted: false },
     });
     if (!existing) return res.status(404).json({ error: 'Expense not found' });
+    if (existing.financial_year_id) {
+      const fy = await prisma.financialYear.findUnique({ where: { id: existing.financial_year_id }, select: { is_locked: true } });
+      if (fy?.is_locked) return res.status(423).json({ error: 'This financial year is locked. No changes are allowed.', code: 'FY_LOCKED' });
+    }
     await prisma.expense.update({
       where: { id: req.params.id },
       data: { is_deleted: true, deleted_at: new Date() },

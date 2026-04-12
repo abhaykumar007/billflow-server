@@ -32,10 +32,17 @@ router.get('/', async (req, res) => {
     const { search = '', page = 1, limit = 100, active } = req.query;
     const skip = (parseInt(page) - 1) * parseInt(limit);
 
+    const { category_id } = req.query;
+
     const where = {
       business_id: businessId,
       is_deleted: false,
       ...(active !== undefined && { is_active: active === 'true' }),
+      ...(category_id === 'none'
+        ? { category_id: null }
+        : category_id
+        ? { category_id }
+        : {}),
       ...(search
         ? {
             OR: [
@@ -53,6 +60,7 @@ router.get('/', async (req, res) => {
         orderBy: { name: 'asc' },
         skip,
         take: parseInt(limit),
+        include: { category: { select: { id: true, name: true, color: true } } },
       }),
       prisma.product.count({ where }),
     ]);
@@ -70,6 +78,7 @@ router.get('/:id', async (req, res) => {
     const businessId = req.user.businessId;
     const product = await prisma.product.findFirst({
       where: { id: req.params.id, business_id: businessId, is_deleted: false },
+      include: { category: { select: { id: true, name: true, color: true } } },
     });
     if (!product) return res.status(404).json({ error: 'Product not found' });
     return res.json(product);
@@ -94,6 +103,7 @@ router.post('/', async (req, res) => {
       track_inventory = false,
       stock_quantity = 0,
       low_stock_alert = 10,
+      category_id,
     } = req.body;
 
     if (!name || !name.trim()) return res.status(400).json({ error: 'Product name is required' });
@@ -111,7 +121,9 @@ router.post('/', async (req, res) => {
         track_inventory: Boolean(track_inventory),
         stock_quantity: track_inventory ? parseInt(stock_quantity) || 0 : 0,
         low_stock_alert: parseInt(low_stock_alert) || 10,
+        category_id: category_id || null,
       },
+      include: { category: { select: { id: true, name: true, color: true } } },
     });
 
     return res.status(201).json(product);
@@ -142,6 +154,7 @@ router.put('/:id', async (req, res) => {
       stock_quantity,
       low_stock_alert,
       is_active,
+      category_id,
     } = req.body;
 
     if (name !== undefined && !name.trim()) {
@@ -162,7 +175,9 @@ router.put('/:id', async (req, res) => {
         ...(stock_quantity !== undefined && { stock_quantity: parseInt(stock_quantity) }),
         ...(low_stock_alert !== undefined && { low_stock_alert: parseInt(low_stock_alert) }),
         ...(is_active !== undefined && { is_active: Boolean(is_active) }),
+        ...('category_id' in req.body && { category_id: category_id || null }),
       },
+      include: { category: { select: { id: true, name: true, color: true } } },
     });
 
     return res.json(updated);

@@ -87,7 +87,7 @@ router.get('/:id', async (req, res) => {
     });
     if (!customer) return res.status(404).json({ error: 'Customer not found' });
 
-    const [invoiceSummary, totalPaid] = await Promise.all([
+    const [invoiceSummary, totalPaid, creditUsed] = await Promise.all([
       prisma.invoice.aggregate({
         where: {
           customer_id: customer.id,
@@ -106,6 +106,17 @@ router.get('/:id', async (req, res) => {
         },
         _sum: { amount: true },
       }),
+      // credit_used = unpaid balance on SALE invoices only
+      prisma.invoice.aggregate({
+        where: {
+          customer_id: customer.id,
+          business_id: businessId,
+          voucher_type: 'SALE',
+          status: { in: ['sent', 'partial'] },
+          is_deleted: false,
+        },
+        _sum: { balance_due: true },
+      }),
     ]);
 
     return res.json({
@@ -115,6 +126,7 @@ router.get('/:id', async (req, res) => {
         totalPaid: totalPaid._sum.amount || 0,
         outstanding: invoiceSummary._sum.balance_due || 0,
         invoiceCount: invoiceSummary._count.id || 0,
+        creditUsed: creditUsed._sum.balance_due || 0,
       },
     });
   } catch (err) {
@@ -224,6 +236,9 @@ router.post('/', async (req, res) => {
       gstin,
       opening_balance = 0,
       balance_type = 'DR',
+      credit_limit = 0,
+      credit_limit_type = 'soft',
+      credit_days = 0,
     } = req.body;
 
     if (!name) return res.status(400).json({ error: 'Name is required' });
@@ -241,6 +256,9 @@ router.post('/', async (req, res) => {
         gstin: gstin?.trim() || null,
         opening_balance: Math.round(opening_balance * 100), // rupees → paise
         balance_type,
+        credit_limit: Math.round((parseFloat(credit_limit) || 0) * 100), // rupees → paise
+        credit_limit_type: ['soft', 'hard'].includes(credit_limit_type) ? credit_limit_type : 'soft',
+        credit_days: parseInt(credit_days) || 0,
       },
     });
 
@@ -289,6 +307,9 @@ router.put('/:id', async (req, res) => {
       state,
       pincode,
       gstin,
+      credit_limit,
+      credit_limit_type,
+      credit_days,
     } = req.body;
 
     if (name !== undefined && !name.trim()) {
@@ -306,6 +327,9 @@ router.put('/:id', async (req, res) => {
         ...(state !== undefined && { state: state.trim() || null }),
         ...(pincode !== undefined && { pincode: pincode.trim() || null }),
         ...(gstin !== undefined && { gstin: gstin.trim() || null }),
+        ...(credit_limit !== undefined && { credit_limit: Math.round((parseFloat(credit_limit) || 0) * 100) }),
+        ...(credit_limit_type !== undefined && { credit_limit_type: ['soft', 'hard'].includes(credit_limit_type) ? credit_limit_type : 'soft' }),
+        ...(credit_days !== undefined && { credit_days: parseInt(credit_days) || 0 }),
       },
     });
 
@@ -313,6 +337,45 @@ router.put('/:id', async (req, res) => {
   } catch (err) {
     console.error('Update customer error:', err);
     return res.status(500).json({ error: 'Failed to update customer' });
+  }
+});
+
+// GET /api/customers/:id/credit-status
+router.get('/:id/credit-status', async (req, res) => {
+  try {
+    const businessId = req.user.businessId;
+    const customer = await prisma.customer.findFirst({
+      where: { id: req.params.id, business_id: businessId, is_deleted: false },
+      select: { credit_limit: true, credit_limit_type: true, credit_days: true },
+    });
+    if (!customer) return res.status(404).json({ error: 'Customer not found' });
+
+    const agg = await prisma.invoice.aggregate({
+      where: {
+        customer_id: req.params.id,
+        business_id: businessId,
+        voucher_type: 'SALE',
+        status: { in: ['sent', 'partial'] },
+        is_deleted: false,
+      },
+      _sum: { balance_due: true },
+    });
+    const current_outstanding = agg._sum.balance_due || 0;
+    const available_credit = customer.credit_limit > 0
+      ? Math.max(0, customer.credit_limit - current_outstanding)
+      : null;
+
+    return res.json({
+      credit_limit: customer.credit_limit,
+      credit_limit_type: customer.credit_limit_type,
+      credit_days: customer.credit_days,
+      current_outstanding,
+      available_credit,
+      over_limit: customer.credit_limit > 0 && current_outstanding > customer.credit_limit,
+    });
+  } catch (err) {
+    console.error('Credit status error:', err);
+    return res.status(500).json({ error: 'Failed to fetch credit status' });
   }
 });
 

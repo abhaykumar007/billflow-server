@@ -3,18 +3,20 @@ const router = express.Router();
 const prisma = require('../utils/prisma');
 const { authenticateToken } = require('../middleware/auth');
 const { checkInvoiceLimit } = require('../middleware/planLimit');
-const { attachFinancialYear } = require('../middleware/financialYear');
+const { attachFinancialYear, requireUnlockedFY, enforceOpenYear } = require('../middleware/financialYear');
 
 router.use(authenticateToken);
 
 const SALE_TYPES = ['SALE', 'SALE_RETURN'];
 const PURCHASE_TYPES = ['PURCHASE', 'PURCHASE_RETURN'];
+const ESTIMATE_TYPES = ['ESTIMATE'];
 
 const VOUCHER_PREFIX = {
   SALE: 'SINV',
   PURCHASE: 'PINV',
   SALE_RETURN: 'SRET',
   PURCHASE_RETURN: 'PRET',
+  ESTIMATE: null, // prefix comes from business.estimate_prefix
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -27,6 +29,26 @@ function fyCode(financialYear) {
 }
 
 async function getNextInvoiceNumber(tx, voucherType, financialYear, businessId) {
+  // ESTIMATE branch — uses its own counter and prefix
+  if (voucherType === 'ESTIMATE') {
+    const [fy, business] = await Promise.all([
+      tx.financialYear.findUnique({
+        where: { id: financialYear.id },
+        select: { estimate_next_number: true },
+      }),
+      businessId
+        ? tx.business.findUnique({ where: { id: businessId }, select: { estimate_prefix: true } })
+        : null,
+    ]);
+    const prefix = business?.estimate_prefix || 'EST';
+    const code = fyCode(financialYear);
+    return {
+      invoiceNumber: `${prefix}-${code}-${String(fy.estimate_next_number).padStart(4, '0')}`,
+      isPurchase: false,
+      isEstimate: true,
+    };
+  }
+
   const isPurchase = PURCHASE_TYPES.includes(voucherType);
   const [fy, business] = await Promise.all([
     tx.financialYear.findUnique({
@@ -47,16 +69,17 @@ async function getNextInvoiceNumber(tx, voucherType, financialYear, businessId) 
   return {
     invoiceNumber: `${prefix}-${code}-${String(nextNum).padStart(4, '0')}`,
     isPurchase,
+    isEstimate: false,
   };
 }
 
-async function incrementCounter(tx, financialYearId, isPurchase) {
-  await tx.financialYear.update({
-    where: { id: financialYearId },
-    data: isPurchase
-      ? { purchase_next_number: { increment: 1 } }
-      : { invoice_next_number: { increment: 1 } },
-  });
+async function incrementCounter(tx, financialYearId, isPurchase, isEstimate = false) {
+  const data = isEstimate
+    ? { estimate_next_number: { increment: 1 } }
+    : isPurchase
+    ? { purchase_next_number: { increment: 1 } }
+    : { invoice_next_number: { increment: 1 } };
+  await tx.financialYear.update({ where: { id: financialYearId }, data });
 }
 
 // Adjust stock: direction +1 = increment, -1 = decrement
@@ -127,6 +150,27 @@ router.get('/next-number', attachFinancialYear, async (req, res) => {
       return res.status(400).json({ error: 'No active financial year. Please select or create a financial year first.' });
     }
     const { type = 'SALE' } = req.query;
+
+    // ESTIMATE uses its own counter and prefix
+    if (type === 'ESTIMATE') {
+      const [fy, business] = await Promise.all([
+        prisma.financialYear.findUnique({
+          where: { id: req.financialYear.id },
+          select: { estimate_next_number: true },
+        }),
+        prisma.business.findUnique({
+          where: { id: req.user.businessId },
+          select: { estimate_prefix: true },
+        }),
+      ]);
+      const prefix = business?.estimate_prefix || 'EST';
+      const code = fyCode(req.financialYear);
+      return res.json({
+        invoiceNumber: `${prefix}-${code}-${String(fy.estimate_next_number).padStart(4, '0')}`,
+        nextNumber: fy.estimate_next_number,
+      });
+    }
+
     const isPurchase = PURCHASE_TYPES.includes(type);
     const [fy, business] = await Promise.all([
       prisma.financialYear.findUnique({
@@ -180,6 +224,11 @@ router.get('/', attachFinancialYear, async (req, res) => {
       where.voucher_type = { in: ['PURCHASE', 'PURCHASE_RETURN'] };
     } else if (type === 'returns') {
       where.voucher_type = { in: ['SALE_RETURN', 'PURCHASE_RETURN'] };
+    } else if (type === 'estimates') {
+      where.voucher_type = 'ESTIMATE';
+    } else {
+      // Default: exclude estimates from the main invoice list
+      where.voucher_type = { not: 'ESTIMATE' };
     }
 
     if (customerId) where.customer_id = customerId;
@@ -262,7 +311,7 @@ router.get('/:id', async (req, res) => {
 });
 
 // ── POST /api/invoices ────────────────────────────────────────────────────────
-router.post('/', attachFinancialYear, checkInvoiceLimit, async (req, res) => {
+router.post('/', attachFinancialYear, enforceOpenYear, requireUnlockedFY, checkInvoiceLimit, async (req, res) => {
   try {
     const {
       voucher_type = 'SALE',
@@ -272,6 +321,7 @@ router.post('/', attachFinancialYear, checkInvoiceLimit, async (req, res) => {
       invoice_number: providedNumber,
       invoice_date,
       due_date,
+      valid_until,
       status = 'draft',
       items,
       discount_amount = 0,
@@ -287,10 +337,13 @@ router.post('/', attachFinancialYear, checkInvoiceLimit, async (req, res) => {
 
     const isSaleType = SALE_TYPES.includes(voucher_type);
     const isPurchaseType = PURCHASE_TYPES.includes(voucher_type);
+    const isEstimateType = ESTIMATE_TYPES.includes(voucher_type);
 
-    if (!isSaleType && !isPurchaseType) {
+    if (!isSaleType && !isPurchaseType && !isEstimateType) {
       return res.status(400).json({ error: 'Invalid voucher_type' });
     }
+
+    let creditWarning = null;
 
     // Validate party
     if (isSaleType) {
@@ -299,13 +352,57 @@ router.post('/', attachFinancialYear, checkInvoiceLimit, async (req, res) => {
         where: { id: customer_id, business_id: req.user.businessId, is_deleted: false },
       });
       if (!customer) return res.status(404).json({ error: 'Customer not found' });
-    } else {
+
+      // Credit limit check for SALE invoices (not returns)
+      if (voucher_type === 'SALE' && customer.credit_limit > 0) {
+        const subtotalCheck = items.reduce((sum, item) => sum + Math.round(item.amount || 0), 0);
+        const taxCheck = items.reduce((sum, item) => sum + Math.round(item.tax_amount || 0), 0);
+        const newTotal = subtotalCheck - Math.round(discount_amount || 0) + taxCheck;
+
+        const outstandingAgg = await prisma.invoice.aggregate({
+          where: {
+            customer_id,
+            business_id: req.user.businessId,
+            voucher_type: 'SALE',
+            status: { in: ['sent', 'partial'] },
+            is_deleted: false,
+          },
+          _sum: { balance_due: true },
+        });
+        const currentOutstanding = outstandingAgg._sum.balance_due || 0;
+
+        if (currentOutstanding + newTotal > customer.credit_limit) {
+          const limitRs = (customer.credit_limit / 100).toFixed(2);
+          const usedRs = (currentOutstanding / 100).toFixed(2);
+          const newRs = (newTotal / 100).toFixed(2);
+          if (customer.credit_limit_type === 'hard') {
+            return res.status(422).json({
+              error: `Credit limit exceeded. Limit: ₹${limitRs}, Already used: ₹${usedRs}, This invoice: ₹${newRs}.`,
+              code: 'CREDIT_LIMIT_EXCEEDED',
+              credit_limit: customer.credit_limit,
+              credit_used: currentOutstanding,
+              invoice_total: newTotal,
+            });
+          }
+          // soft limit — allow save but attach warning to response
+          creditWarning = {
+            warning: true,
+            message: `Credit limit exceeded. Limit: ₹${limitRs}, Already used: ₹${usedRs}, This invoice: ₹${newRs}.`,
+            code: 'CREDIT_LIMIT_EXCEEDED',
+            credit_limit: customer.credit_limit,
+            credit_used: currentOutstanding,
+            invoice_total: newTotal,
+          };
+        }
+      }
+    } else if (isPurchaseType) {
       if (!supplier_id) return res.status(400).json({ error: 'Supplier is required for purchase invoices' });
       const supplier = await prisma.supplier.findFirst({
         where: { id: supplier_id, business_id: req.user.businessId, is_deleted: false },
       });
       if (!supplier) return res.status(404).json({ error: 'Supplier not found' });
     }
+    // isEstimateType: customer_id is optional
 
     const subtotal = items.reduce((sum, item) => sum + Math.round(item.amount || 0), 0);
     const tax_amount = items.reduce((sum, item) => sum + Math.round(item.tax_amount || 0), 0);
@@ -328,12 +425,13 @@ router.post('/', attachFinancialYear, checkInvoiceLimit, async (req, res) => {
           business_id: req.user.businessId,
           financial_year_id: req.financialYear.id,
           voucher_type,
-          customer_id: isSaleType ? customer_id : null,
+          customer_id: (isSaleType || isEstimateType) ? (customer_id || null) : null,
           supplier_id: isPurchaseType ? supplier_id : null,
           linked_invoice_id: linked_invoice_id || null,
           invoice_number: finalNumber,
           invoice_date: invoice_date ? new Date(invoice_date) : new Date(),
           due_date: due_date ? new Date(due_date) : null,
+          valid_until: valid_until ? new Date(valid_until) : null,
           status,
           subtotal,
           discount_amount: Math.round(discount_amount),
@@ -361,9 +459,10 @@ router.post('/', attachFinancialYear, checkInvoiceLimit, async (req, res) => {
         include: { customer: true, supplier: true, items: true },
       });
 
-      await incrementCounter(tx, req.financialYear.id, isPurchaseType);
+      await incrementCounter(tx, req.financialYear.id, isPurchaseType, isEstimateType);
 
-      if (status !== 'draft') {
+      // Estimates never touch ledger or inventory
+      if (!isEstimateType && status !== 'draft') {
         const entryDate = invoice_date ? new Date(invoice_date) : new Date();
 
         const fyId = req.financialYear.id;
@@ -385,6 +484,9 @@ router.post('/', attachFinancialYear, checkInvoiceLimit, async (req, res) => {
       return newInvoice;
     });
 
+    if (creditWarning) {
+      return res.status(201).json({ ...invoice, ...creditWarning });
+    }
     res.status(201).json(invoice);
   } catch (err) {
     console.error(err);
@@ -402,6 +504,10 @@ router.put('/:id', async (req, res) => {
       where: { id: req.params.id, business_id: req.user.businessId, is_deleted: false },
     });
     if (!existing) return res.status(404).json({ error: 'Invoice not found' });
+    if (existing.financial_year_id) {
+      const fy = await prisma.financialYear.findUnique({ where: { id: existing.financial_year_id }, select: { is_locked: true } });
+      if (fy?.is_locked) return res.status(423).json({ error: 'This financial year is locked. No changes are allowed.', code: 'FY_LOCKED' });
+    }
     if (existing.status !== 'draft') return res.status(400).json({ error: 'Only draft invoices can be edited' });
 
     const { customer_id, supplier_id, invoice_date, due_date, items, discount_amount = 0, notes, terms } = req.body;
@@ -464,6 +570,10 @@ router.post('/:id/send', async (req, res) => {
     });
     if (!invoice) return res.status(404).json({ error: 'Invoice not found' });
     if (invoice.status !== 'draft') return res.status(400).json({ error: 'Only draft invoices can be sent' });
+    if (invoice.financial_year_id) {
+      const fy = await prisma.financialYear.findUnique({ where: { id: invoice.financial_year_id }, select: { is_locked: true } });
+      if (fy?.is_locked) return res.status(423).json({ error: 'This financial year is locked. No changes are allowed.', code: 'FY_LOCKED' });
+    }
 
     const updated = await prisma.$transaction(async (tx) => {
       const updatedInvoice = await tx.invoice.update({
@@ -498,6 +608,80 @@ router.post('/:id/send', async (req, res) => {
   }
 });
 
+// ── POST /api/invoices/:id/convert — convert estimate → SALE invoice ─────────
+router.post('/:id/convert', attachFinancialYear, enforceOpenYear, requireUnlockedFY, async (req, res) => {
+  try {
+    const estimate = await prisma.invoice.findFirst({
+      where: { id: req.params.id, business_id: req.user.businessId, is_deleted: false },
+      include: { items: true },
+    });
+    if (!estimate) return res.status(404).json({ error: 'Estimate not found' });
+    if (estimate.voucher_type !== 'ESTIMATE') return res.status(400).json({ error: 'Not an estimate' });
+    if (estimate.status === 'converted') return res.status(422).json({ error: 'Estimate already converted' });
+
+    if (!req.financialYear) {
+      return res.status(400).json({ error: 'No active financial year' });
+    }
+
+    const { invoice_date, due_date } = req.body || {};
+
+    const newInvoice = await prisma.$transaction(async (tx) => {
+      const { invoiceNumber } = await getNextInvoiceNumber(tx, 'SALE', req.financialYear, req.user.businessId);
+
+      const created = await tx.invoice.create({
+        data: {
+          business_id: req.user.businessId,
+          financial_year_id: req.financialYear.id,
+          voucher_type: 'SALE',
+          customer_id: estimate.customer_id,
+          linked_invoice_id: estimate.id,
+          invoice_number: invoiceNumber,
+          invoice_date: invoice_date ? new Date(invoice_date) : new Date(),
+          due_date: due_date ? new Date(due_date) : null,
+          status: 'draft',
+          subtotal: estimate.subtotal,
+          discount_amount: estimate.discount_amount,
+          tax_amount: estimate.tax_amount,
+          total_amount: estimate.total_amount,
+          amount_paid: 0,
+          balance_due: estimate.total_amount,
+          notes: estimate.notes,
+          terms: estimate.terms,
+          created_by: req.user.userId,
+          items: {
+            create: estimate.items.map((item) => ({
+              product_id: item.product_id,
+              description: item.description,
+              quantity: item.quantity,
+              unit: item.unit,
+              rate: item.rate,
+              discount_percent: item.discount_percent,
+              tax_rate: item.tax_rate,
+              tax_amount: item.tax_amount,
+              amount: item.amount,
+            })),
+          },
+        },
+        include: { customer: true, items: true },
+      });
+
+      await incrementCounter(tx, req.financialYear.id, false, false);
+
+      await tx.invoice.update({
+        where: { id: estimate.id },
+        data: { status: 'converted' },
+      });
+
+      return created;
+    });
+
+    res.status(201).json(newInvoice);
+  } catch (err) {
+    console.error('Convert estimate error:', err);
+    res.status(500).json({ error: 'Failed to convert estimate' });
+  }
+});
+
 // ── DELETE /api/invoices/:id — cancel invoice ─────────────────────────────────
 router.delete('/:id', async (req, res) => {
   try {
@@ -507,6 +691,10 @@ router.delete('/:id', async (req, res) => {
     });
     if (!invoice) return res.status(404).json({ error: 'Invoice not found' });
     if (invoice.status === 'paid') return res.status(400).json({ error: 'Cannot cancel a fully paid invoice' });
+    if (invoice.financial_year_id) {
+      const fy = await prisma.financialYear.findUnique({ where: { id: invoice.financial_year_id }, select: { is_locked: true } });
+      if (fy?.is_locked) return res.status(423).json({ error: 'This financial year is locked. No changes are allowed.', code: 'FY_LOCKED' });
+    }
 
     await prisma.$transaction(async (tx) => {
       await tx.invoice.update({

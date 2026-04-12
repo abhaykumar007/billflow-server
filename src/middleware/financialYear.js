@@ -31,4 +31,32 @@ async function attachFinancialYear(req, res, next) {
   }
 }
 
-module.exports = { attachFinancialYear };
+/**
+ * Middleware: block writes if the current financial year is locked.
+ * Must be used AFTER attachFinancialYear.
+ */
+function requireUnlockedFY(req, res, next) {
+  if (req.financialYear?.is_locked) {
+    return res.status(423).json({
+      error: 'This financial year is locked. No changes are allowed.',
+      code: 'FY_LOCKED',
+    });
+  }
+  next();
+}
+
+/**
+ * Middleware: block writes if the current financial year is closed.
+ * Must be used AFTER attachFinancialYear.
+ */
+function enforceOpenYear(req, res, next) {
+  if (req.financialYear?.is_closed) {
+    return res.status(403).json({
+      error: 'Financial year is closed. No transactions can be added to a closed year.',
+      code: 'FY_CLOSED',
+    });
+  }
+  next();
+}
+
+module.exports = { attachFinancialYear, requireUnlockedFY, enforceOpenYear };

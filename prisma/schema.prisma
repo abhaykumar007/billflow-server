@@ -8,21 +8,28 @@ datasource db {
 }
 
 model FinancialYear {
-  id                    String                @id @default(cuid())
-  business_id           String
-  label                 String
-  start_date            DateTime
-  end_date              DateTime
-  is_active             Boolean               @default(false)
-  invoice_next_number   Int                   @default(1)
-  purchase_next_number  Int                   @default(1)
-  created_at            DateTime              @default(now())
-  expenses              Expense[]
-  business              Business              @relation(fields: [business_id], references: [id])
-  invoices              Invoice[]
-  ledgerEntries         LedgerEntry[]
-  payments              Payment[]
-  supplierLedgerEntries SupplierLedgerEntry[]
+  id                     String                @id @default(cuid())
+  business_id            String
+  label                  String
+  start_date             DateTime
+  end_date               DateTime
+  is_active              Boolean               @default(false)
+  is_locked              Boolean               @default(false)
+  is_closed              Boolean               @default(false)
+  closed_at              DateTime?
+  closed_by_id           String?
+  opening_stock_snapshot Json?
+  invoice_next_number    Int                   @default(1)
+  purchase_next_number   Int                   @default(1)
+  estimate_next_number   Int                   @default(1)
+  created_at             DateTime              @default(now())
+  expenses               Expense[]
+  business               Business              @relation(fields: [business_id], references: [id])
+  closed_by              User?                 @relation("ClosedYears", fields: [closed_by_id], references: [id])
+  invoices               Invoice[]
+  ledgerEntries          LedgerEntry[]
+  payments               Payment[]
+  supplierLedgerEntries  SupplierLedgerEntry[]
 
   @@unique([business_id, label])
 }
@@ -47,16 +54,20 @@ model Business {
   default_notes         String?
   default_terms         String?
   default_tax_rate      Float                 @default(18)
+  estimate_prefix       String                @default("EST")
   created_at            DateTime              @default(now())
   updated_at            DateTime              @updatedAt
   purchase_next_number  Int                   @default(1)
   purchase_prefix       String                @default("PUR")
+  bankAccounts          BankAccount[]
   customers             Customer[]
   expenses              Expense[]
   financialYears        FinancialYear[]
+  fundTransfers         FundTransfer[]
   invoices              Invoice[]
   ledgerEntries         LedgerEntry[]
   payments              Payment[]
+  productCategories     ProductCategory[]
   products              Product[]
   subscription          Subscription?
   suppliers             Supplier[]
@@ -75,8 +86,9 @@ model User {
   refresh_token String?
   created_at    DateTime  @default(now())
   updated_at    DateTime  @updatedAt
-  invoices      Invoice[] @relation("CreatedBy")
-  business      Business  @relation(fields: [business_id], references: [id])
+  invoices      Invoice[]       @relation("CreatedBy")
+  closed_years  FinancialYear[] @relation("ClosedYears")
+  business      Business        @relation(fields: [business_id], references: [id])
 }
 
 model Customer {
@@ -92,7 +104,10 @@ model Customer {
   gstin           String?
   opening_balance Int           @default(0)
   balance_type    String        @default("DR")
-  is_deleted      Boolean       @default(false)
+  credit_limit      Int           @default(0)
+  credit_limit_type String        @default("soft")
+  credit_days       Int           @default(0)
+  is_deleted        Boolean       @default(false)
   created_at      DateTime      @default(now())
   updated_at      DateTime      @updatedAt
   business        Business      @relation(fields: [business_id], references: [id])
@@ -115,6 +130,7 @@ model Supplier {
   pan             String?
   opening_balance Int                   @default(0)
   balance_type    String                @default("CR")
+  credit_days     Int                   @default(0)
   is_deleted      Boolean               @default(false)
   created_at      DateTime              @default(now())
   updated_at      DateTime              @updatedAt
@@ -143,25 +159,41 @@ model SupplierLedgerEntry {
   supplier          Supplier       @relation(fields: [supplier_id], references: [id])
 }
 
+model ProductCategory {
+  id          String    @id @default(cuid())
+  business_id String
+  name        String
+  color       String    @default("#6366f1")
+  is_deleted  Boolean   @default(false)
+  created_at  DateTime  @default(now())
+  updated_at  DateTime  @updatedAt
+  business    Business  @relation(fields: [business_id], references: [id])
+  products    Product[]
+
+  @@unique([business_id, name])
+}
+
 model Product {
-  id              String        @id @default(cuid())
+  id              String           @id @default(cuid())
   business_id     String
+  category_id     String?
   name            String
   description     String?
-  unit            String        @default("pcs")
-  sale_price      Int           @default(0)
-  purchase_price  Int           @default(0)
-  tax_rate        Float         @default(18)
+  unit            String           @default("pcs")
+  sale_price      Int              @default(0)
+  purchase_price  Int              @default(0)
+  tax_rate        Float            @default(18)
   hsn_code        String?
-  track_inventory Boolean       @default(false)
-  stock_quantity  Int           @default(0)
-  low_stock_alert Int           @default(10)
-  is_active       Boolean       @default(true)
-  is_deleted      Boolean       @default(false)
-  created_at      DateTime      @default(now())
-  updated_at      DateTime      @updatedAt
+  track_inventory Boolean          @default(false)
+  stock_quantity  Int              @default(0)
+  low_stock_alert Int              @default(10)
+  is_active       Boolean          @default(true)
+  is_deleted      Boolean          @default(false)
+  created_at      DateTime         @default(now())
+  updated_at      DateTime         @updatedAt
   invoiceItems    InvoiceItem[]
-  business        Business      @relation(fields: [business_id], references: [id])
+  business        Business         @relation(fields: [business_id], references: [id])
+  category        ProductCategory? @relation(fields: [category_id], references: [id])
 }
 
 model Invoice {
@@ -187,6 +219,7 @@ model Invoice {
   financial_year_id String?
   linked_invoice_id String?
   supplier_id       String?
+  valid_until       DateTime?
   voucher_type      String         @default("SALE")
   business          Business       @relation(fields: [business_id], references: [id])
   creator           User           @relation("CreatedBy", fields: [created_by], references: [id])
@@ -219,26 +252,41 @@ model InvoiceItem {
 }
 
 model Payment {
-  id                String         @id @default(cuid())
-  business_id       String
-  invoice_id        String
-  customer_id       String?
-  supplier_id       String?
-  party_type        String         @default("CUSTOMER")
-  payment_type      String         @default("RECEIVED")
-  amount            Int
-  payment_date      DateTime       @default(now())
-  payment_mode      String         @default("cash")
-  reference_number  String?
-  notes             String?
-  is_reversed       Boolean        @default(false)
-  created_at        DateTime       @default(now())
-  financial_year_id String?
-  business          Business       @relation(fields: [business_id], references: [id])
-  customer          Customer?      @relation(fields: [customer_id], references: [id])
-  supplier          Supplier?      @relation(fields: [supplier_id], references: [id])
-  financialYear     FinancialYear? @relation(fields: [financial_year_id], references: [id])
-  invoice           Invoice        @relation(fields: [invoice_id], references: [id])
+  id                        String         @id @default(cuid())
+  business_id               String
+  invoice_id                String?
+  customer_id               String?
+  supplier_id               String?
+  bank_account_id           String?
+  party_type                String         @default("CUSTOMER")
+  payment_type              String         @default("RECEIVED")
+  amount                    Int
+  payment_date              DateTime       @default(now())
+  payment_mode              String?
+  reference_number          String?
+  notes                     String?
+  is_reversed               Boolean        @default(false)
+  advance_payment           Boolean        @default(false)
+  advance_balance_remaining Int            @default(0)
+  created_at                DateTime       @default(now())
+  financial_year_id         String?
+  bankAccount               BankAccount?   @relation(fields: [bank_account_id], references: [id])
+  business                  Business       @relation(fields: [business_id], references: [id])
+  customer                  Customer?      @relation(fields: [customer_id], references: [id])
+  supplier                  Supplier?      @relation(fields: [supplier_id], references: [id])
+  financialYear             FinancialYear? @relation(fields: [financial_year_id], references: [id])
+  invoice                   Invoice?       @relation(fields: [invoice_id], references: [id])
+  splits                    PaymentSplit[]
+}
+
+model PaymentSplit {
+  id           String  @id @default(cuid())
+  payment_id   String
+  payment_mode String
+  amount       Int
+  payment      Payment @relation(fields: [payment_id], references: [id])
+
+  @@map("payment_splits")
 }
 
 model LedgerEntry {
@@ -266,6 +314,7 @@ model Expense {
   category          String
   amount            Int
   payment_mode      String         @default("cash")
+  bank_account_id   String?
   description       String?
   expense_date      DateTime       @default(now())
   receipt_url       String?
@@ -273,6 +322,7 @@ model Expense {
   deleted_at        DateTime?
   created_at        DateTime       @default(now())
   financial_year_id String?
+  bankAccount       BankAccount?   @relation(fields: [bank_account_id], references: [id])
   business          Business       @relation(fields: [business_id], references: [id])
   financialYear     FinancialYear? @relation(fields: [financial_year_id], references: [id])
 }
@@ -287,4 +337,43 @@ model Subscription {
   expires_at               DateTime?
   created_at               DateTime  @default(now())
   business                 Business  @relation(fields: [business_id], references: [id])
+}
+
+model BankAccount {
+  id              String         @id @default(cuid())
+  business_id     String
+  account_name    String
+  bank_name       String?
+  account_number  String?
+  ifsc_code       String?
+  opening_balance Int            @default(0)
+  current_balance Int            @default(0)
+  is_active       Boolean        @default(true)
+  is_deleted      Boolean        @default(false)
+  created_at      DateTime       @default(now())
+  updated_at      DateTime       @updatedAt
+  business        Business       @relation(fields: [business_id], references: [id])
+  expenses        Expense[]
+  payments        Payment[]
+  transfersFrom   FundTransfer[] @relation("TransferFrom")
+  transfersTo     FundTransfer[] @relation("TransferTo")
+
+  @@map("bank_accounts")
+}
+
+model FundTransfer {
+  id               String      @id @default(cuid())
+  business_id      String
+  from_account_id  String
+  to_account_id    String
+  amount           Int
+  transfer_date    DateTime    @default(now())
+  reference_number String?
+  notes            String?
+  created_at       DateTime    @default(now())
+  business         Business    @relation(fields: [business_id], references: [id])
+  from_account     BankAccount @relation("TransferFrom", fields: [from_account_id], references: [id])
+  to_account       BankAccount @relation("TransferTo", fields: [to_account_id], references: [id])
+
+  @@map("fund_transfers")
 }

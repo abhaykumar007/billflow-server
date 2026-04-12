@@ -28,6 +28,7 @@ router.get('/summary', attachFinancialYear, async (req, res) => {
       outstandingResult,
       totalPayableResult,
       monthCollectedResult,
+      openEstimatesCount,
       recentInvoices,
       topCustomers,
       topSuppliers,
@@ -106,9 +107,20 @@ router.get('/summary', attachFinancialYear, async (req, res) => {
         _sum: { amount: true },
       }),
 
-      // Recent 5 SALE invoices
+      // Open estimates count
+      prisma.invoice.count({
+        where: {
+          business_id: businessId,
+          ...fyFilter,
+          voucher_type: 'ESTIMATE',
+          status: { in: ['draft', 'sent'] },
+          is_deleted: false,
+        },
+      }),
+
+      // Recent invoices (excluding estimates)
       prisma.invoice.findMany({
-        where: { business_id: businessId, ...fyFilter, is_deleted: false },
+        where: { business_id: businessId, ...fyFilter, is_deleted: false, voucher_type: { not: 'ESTIMATE' } },
         orderBy: { created_at: 'desc' },
         take: 8,
         select: {
@@ -188,6 +200,7 @@ router.get('/summary', attachFinancialYear, async (req, res) => {
       totalOutstanding: outstandingResult._sum.balance_due || 0,
       totalPayable: totalPayableResult._sum.balance_due || 0,
       monthCollected: monthCollectedResult._sum.amount || 0,
+      openEstimates: openEstimatesCount,
       recentInvoices,
       topCustomers: enrichedTopCustomers,
       topSuppliers: enrichedTopSuppliers,

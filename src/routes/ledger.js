@@ -141,18 +141,27 @@ router.get('/customers/:id', async (req, res) => {
       orderBy: [{ entry_date: 'asc' }, { created_at: 'asc' }],
     });
 
-    // Opening balance for this view: if FY-filtered, use closing balance of prior FY; else use customer's initial OB
+    // Opening balance for this view:
+    // - If the current FY has a carry_forward entry, that entry IS the opening balance
+    //   (it's already included in entries), so opening = 0 to avoid double-counting.
+    // - Otherwise fall back to the closing balance of the prior FY, or the customer's
+    //   initial opening_balance if no prior entries exist.
     let openingBalance = customer.opening_balance;
     if (financial_year_id) {
-      const prevEntry = await prisma.ledgerEntry.findFirst({
-        where: {
-          business_id: businessId,
-          customer_id: req.params.id,
-          financial_year_id: { not: financial_year_id },
-        },
-        orderBy: { created_at: 'desc' },
-      });
-      if (prevEntry) openingBalance = prevEntry.balance;
+      const carryForwardEntry = entries.find((e) => e.reference_type === 'carry_forward');
+      if (carryForwardEntry) {
+        openingBalance = 0;
+      } else {
+        const prevEntry = await prisma.ledgerEntry.findFirst({
+          where: {
+            business_id: businessId,
+            customer_id: req.params.id,
+            financial_year_id: { not: financial_year_id },
+          },
+          orderBy: { created_at: 'desc' },
+        });
+        if (prevEntry) openingBalance = prevEntry.balance;
+      }
     }
 
     const totalDebit = entries.reduce((s, e) => s + e.debit, 0);
@@ -273,18 +282,27 @@ router.get('/suppliers/:id', async (req, res) => {
       orderBy: [{ entry_date: 'asc' }, { created_at: 'asc' }],
     });
 
-    // Opening balance for this view: if FY-filtered, use closing balance of prior FY
+    // Opening balance for this view:
+    // - If the current FY has a carry_forward entry, that entry IS the opening balance
+    //   (it's already included in entries), so opening = 0 to avoid double-counting.
+    // - Otherwise fall back to the closing balance of the prior FY, or the supplier's
+    //   initial opening_balance if no prior entries exist.
     let openingBalance = supplier.opening_balance;
     if (financial_year_id) {
-      const prevEntry = await prisma.supplierLedgerEntry.findFirst({
-        where: {
-          business_id: businessId,
-          supplier_id: req.params.id,
-          financial_year_id: { not: financial_year_id },
-        },
-        orderBy: { created_at: 'desc' },
-      });
-      if (prevEntry) openingBalance = prevEntry.balance;
+      const carryForwardEntry = entries.find((e) => e.reference_type === 'carry_forward');
+      if (carryForwardEntry) {
+        openingBalance = 0;
+      } else {
+        const prevEntry = await prisma.supplierLedgerEntry.findFirst({
+          where: {
+            business_id: businessId,
+            supplier_id: req.params.id,
+            financial_year_id: { not: financial_year_id },
+          },
+          orderBy: { created_at: 'desc' },
+        });
+        if (prevEntry) openingBalance = prevEntry.balance;
+      }
     }
 
     const totalDebit = entries.reduce((s, e) => s + e.debit, 0);
