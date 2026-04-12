@@ -618,6 +618,106 @@ router.get('/product-sales', async (req, res) => {
   }
 });
 
+// GET /api/reports/stock-summary
+router.get('/stock-summary', async (req, res) => {
+  const businessId = req.user.businessId;
+  const fy = req.financialYear;
+
+  try {
+    const products = await prisma.product.findMany({
+      where: { business_id: businessId, is_deleted: false, is_active: true },
+      select: {
+        id: true,
+        name: true,
+        unit: true,
+        purchase_price: true,
+        category: { select: { name: true } },
+      },
+      orderBy: { name: 'asc' },
+    });
+
+    if (products.length === 0) {
+      return res.json({ products: [], totals: { total_closing_qty: 0, total_stock_value: 0 } });
+    }
+
+    const productIds = products.map((p) => p.id);
+    const snapshot = fy?.opening_stock_snapshot || {};
+
+    // Invoice filter: only confirmed invoices in active FY
+    const invoiceWhere = {
+      business_id: businessId,
+      is_deleted: false,
+      status: { notIn: ['draft', 'cancelled'] },
+      ...(fy ? { financial_year_id: fy.id } : {}),
+    };
+
+    // Query per-voucher-type breakdown in parallel
+    const [purchasedAgg, purchaseReturnAgg, soldAgg, saleReturnAgg] = await Promise.all([
+      prisma.invoiceItem.groupBy({
+        by: ['product_id'],
+        where: { product_id: { in: productIds }, invoice: { ...invoiceWhere, voucher_type: 'PURCHASE' } },
+        _sum: { quantity: true },
+      }),
+      prisma.invoiceItem.groupBy({
+        by: ['product_id'],
+        where: { product_id: { in: productIds }, invoice: { ...invoiceWhere, voucher_type: 'PURCHASE_RETURN' } },
+        _sum: { quantity: true },
+      }),
+      prisma.invoiceItem.groupBy({
+        by: ['product_id'],
+        where: { product_id: { in: productIds }, invoice: { ...invoiceWhere, voucher_type: 'SALE' } },
+        _sum: { quantity: true },
+      }),
+      prisma.invoiceItem.groupBy({
+        by: ['product_id'],
+        where: { product_id: { in: productIds }, invoice: { ...invoiceWhere, voucher_type: 'SALE_RETURN' } },
+        _sum: { quantity: true },
+      }),
+    ]);
+
+    const toMap = (agg) => Object.fromEntries(agg.map((r) => [r.product_id, r._sum.quantity || 0]));
+    const purchasedMap    = toMap(purchasedAgg);
+    const purchaseRetMap  = toMap(purchaseReturnAgg);
+    const soldMap         = toMap(soldAgg);
+    const saleRetMap      = toMap(saleReturnAgg);
+
+    const result = products.map((p) => {
+      const opening_qty      = snapshot[p.id] ?? 0;
+      const purchased_qty    = purchasedMap[p.id]   || 0;
+      const purchase_return  = purchaseRetMap[p.id]  || 0;
+      const sold_qty         = soldMap[p.id]         || 0;
+      const sale_return_qty  = saleRetMap[p.id]      || 0;
+      const closing_qty      = opening_qty + purchased_qty - purchase_return - sold_qty + sale_return_qty;
+      const stock_value      = closing_qty * (p.purchase_price || 0);
+
+      return {
+        id: p.id,
+        name: p.name,
+        unit: p.unit,
+        category_name: p.category?.name || null,
+        opening_qty,
+        purchased_qty,
+        purchase_return,
+        sold_qty,
+        sale_return_qty,
+        closing_qty,
+        purchase_price: p.purchase_price || 0,
+        stock_value,
+      };
+    });
+
+    const totals = {
+      total_closing_qty: result.reduce((s, p) => s + p.closing_qty, 0),
+      total_stock_value: result.reduce((s, p) => s + p.stock_value, 0),
+    };
+
+    return res.json({ products: result, totals });
+  } catch (err) {
+    console.error('Stock summary error:', err);
+    return res.status(500).json({ error: 'Failed to fetch stock summary' });
+  }
+});
+
 // GET /api/reports/day-book?date=YYYY-MM-DD
 router.get('/day-book', async (req, res) => {
   const { date } = req.query;
