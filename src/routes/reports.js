@@ -363,46 +363,127 @@ router.get('/payments-made', async (req, res) => {
 router.get('/profit-loss', async (req, res) => {
   const { from, to } = req.query;
   const businessId = req.user.businessId;
+  const fy = req.financialYear;
 
-  const baseWhere = {
+  const effectiveFrom = from || (fy ? fy.start_date : null);
+  const effectiveTo   = to   || (fy ? fy.end_date   : null);
+
+  // Invoice date filter
+  const invoiceDateFilter = {};
+  if (effectiveFrom || effectiveTo) {
+    invoiceDateFilter.invoice_date = {};
+    if (effectiveFrom) invoiceDateFilter.invoice_date.gte = new Date(effectiveFrom);
+    if (effectiveTo) {
+      const d = new Date(effectiveTo);
+      d.setHours(23, 59, 59, 999);
+      invoiceDateFilter.invoice_date.lte = d;
+    }
+  }
+
+  const invoiceBaseWhere = {
     business_id: businessId,
     is_deleted: false,
     status: { notIn: ['draft', 'cancelled'] },
-    ...parseDateRange(from, to, req.financialYear),
+    ...invoiceDateFilter,
   };
 
+  // Expense date filter
+  const expenseDateFilter = {};
+  if (effectiveFrom || effectiveTo) {
+    expenseDateFilter.expense_date = {};
+    if (effectiveFrom) expenseDateFilter.expense_date.gte = new Date(effectiveFrom);
+    if (effectiveTo) {
+      const d = new Date(effectiveTo);
+      d.setHours(23, 59, 59, 999);
+      expenseDateFilter.expense_date.lte = d;
+    }
+  }
+
   try {
-    const [sales, saleReturns, purchases, purchaseReturns] = await Promise.all([
-      prisma.invoice.aggregate({ where: { ...baseWhere, voucher_type: 'SALE' }, _sum: { total_amount: true, tax_amount: true, subtotal: true }, _count: { id: true } }),
-      prisma.invoice.aggregate({ where: { ...baseWhere, voucher_type: 'SALE_RETURN' }, _sum: { total_amount: true }, _count: { id: true } }),
-      prisma.invoice.aggregate({ where: { ...baseWhere, voucher_type: 'PURCHASE' }, _sum: { total_amount: true, tax_amount: true, subtotal: true }, _count: { id: true } }),
-      prisma.invoice.aggregate({ where: { ...baseWhere, voucher_type: 'PURCHASE_RETURN' }, _sum: { total_amount: true }, _count: { id: true } }),
+    const [saleAgg, saleReturnAgg, saleItems, saleReturnItems, expenses] = await Promise.all([
+      // Step 1: SALE totals
+      prisma.invoice.aggregate({
+        where: { ...invoiceBaseWhere, voucher_type: 'SALE' },
+        _sum: { total_amount: true, tax_amount: true },
+        _count: { id: true },
+      }),
+      // Step 2: SALE_RETURN totals
+      prisma.invoice.aggregate({
+        where: { ...invoiceBaseWhere, voucher_type: 'SALE_RETURN' },
+        _sum: { total_amount: true },
+        _count: { id: true },
+      }),
+      // Step 3: SALE items → COGS
+      prisma.invoiceItem.findMany({
+        where: { invoice: { ...invoiceBaseWhere, voucher_type: 'SALE' } },
+        select: { quantity: true, product: { select: { purchase_price: true } } },
+      }),
+      // Step 4: SALE_RETURN items → COGS reduction
+      prisma.invoiceItem.findMany({
+        where: { invoice: { ...invoiceBaseWhere, voucher_type: 'SALE_RETURN' } },
+        select: { quantity: true, product: { select: { purchase_price: true } } },
+      }),
+      // Step 5: Expenses in period
+      prisma.expense.findMany({
+        where: {
+          business_id: businessId,
+          is_deleted: false,
+          ...(fy ? { financial_year_id: fy.id } : {}),
+          ...expenseDateFilter,
+        },
+        select: { category: true, amount: true },
+      }),
     ]);
 
-    const gross_sales = sales._sum.total_amount || 0;
-    const sales_return = saleReturns._sum.total_amount || 0;
-    const net_sales = gross_sales - sales_return;
+    // Net sales
+    const gross_sales       = saleAgg._sum.total_amount || 0;
+    const sale_returns      = saleReturnAgg._sum.total_amount || 0;
+    const net_sales_after_returns = gross_sales - sale_returns;
 
-    const gross_purchases = purchases._sum.total_amount || 0;
-    const purchase_return = purchaseReturns._sum.total_amount || 0;
-    const net_purchases = gross_purchases - purchase_return;
+    // COGS: quantity × product.purchase_price
+    let cogs = 0;
+    for (const item of saleItems) {
+      if (item.product?.purchase_price) cogs += item.quantity * item.product.purchase_price;
+    }
+    for (const item of saleReturnItems) {
+      if (item.product?.purchase_price) cogs -= item.quantity * item.product.purchase_price;
+    }
 
-    const gross_profit = net_sales - net_purchases;
-    const sales_tax = sales._sum.tax_amount || 0;
-    const purchase_tax = purchases._sum.tax_amount || 0;
-    const net_gst_payable = sales_tax - purchase_tax;
+    const gross_profit = net_sales_after_returns - cogs;
 
-    res.json({
-      gross_sales, sales_return, net_sales,
-      gross_purchases, purchase_return, net_purchases,
+    // Expenses by category
+    const categoryMap = {};
+    for (const exp of expenses) {
+      const cat = exp.category || 'Uncategorized';
+      if (!categoryMap[cat]) categoryMap[cat] = { category: cat, amount: 0 };
+      categoryMap[cat].amount += exp.amount;
+    }
+    const expenses_breakdown = Object.values(categoryMap).sort((a, b) => b.amount - a.amount);
+    const total_expenses = expenses.reduce((s, e) => s + e.amount, 0);
+
+    const net_profit = gross_profit - total_expenses;
+
+    return res.json({
+      period: {
+        from: effectiveFrom ? new Date(effectiveFrom).toISOString().split('T')[0] : null,
+        to:   effectiveTo   ? new Date(effectiveTo).toISOString().split('T')[0]   : null,
+      },
+      gross_sales,
+      sale_returns,
+      net_sales_after_returns,
+      cogs,
       gross_profit,
-      sales_invoice_count: sales._count.id,
-      purchase_invoice_count: purchases._count.id,
-      sales_tax, purchase_tax, net_gst_payable,
+      expenses_breakdown,
+      total_expenses,
+      net_profit,
+      sales_invoice_count: saleAgg._count.id,
+      return_invoice_count: saleReturnAgg._count.id,
+      // GST (kept for reference)
+      sales_tax: saleAgg._sum.tax_amount || 0,
     });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Failed to fetch P&L summary' });
+    console.error('P&L error:', err);
+    return res.status(500).json({ error: 'Failed to fetch P&L' });
   }
 });
 
@@ -534,6 +615,142 @@ router.get('/product-sales', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to fetch product sales' });
+  }
+});
+
+// GET /api/reports/day-book?date=YYYY-MM-DD
+router.get('/day-book', async (req, res) => {
+  const { date } = req.query;
+  const businessId = req.user.businessId;
+
+  const targetDate = date ? new Date(date) : new Date();
+  const dayStart = new Date(targetDate);
+  dayStart.setHours(0, 0, 0, 0);
+  const dayEnd = new Date(targetDate);
+  dayEnd.setHours(23, 59, 59, 999);
+
+  try {
+    const [invoices, payments, expenses] = await Promise.all([
+      prisma.invoice.findMany({
+        where: {
+          business_id: businessId,
+          is_deleted: false,
+          voucher_type: { in: ['SALE', 'PURCHASE', 'SALE_RETURN', 'PURCHASE_RETURN'] },
+          status: { notIn: ['draft', 'cancelled'] },
+          invoice_date: { gte: dayStart, lte: dayEnd },
+        },
+        select: {
+          id: true,
+          invoice_number: true,
+          voucher_type: true,
+          total_amount: true,
+          created_at: true,
+          customer: { select: { name: true } },
+          supplier: { select: { name: true } },
+        },
+        orderBy: { created_at: 'asc' },
+      }),
+      prisma.payment.findMany({
+        where: {
+          business_id: businessId,
+          payment_date: { gte: dayStart, lte: dayEnd },
+        },
+        select: {
+          id: true,
+          reference_number: true,
+          payment_type: true,
+          amount: true,
+          created_at: true,
+          customer: { select: { name: true } },
+          supplier: { select: { name: true } },
+        },
+        orderBy: { created_at: 'asc' },
+      }),
+      prisma.expense.findMany({
+        where: {
+          business_id: businessId,
+          is_deleted: false,
+          expense_date: { gte: dayStart, lte: dayEnd },
+        },
+        select: {
+          id: true,
+          category: true,
+          amount: true,
+          payment_mode: true,
+          description: true,
+          created_at: true,
+        },
+        orderBy: { created_at: 'asc' },
+      }),
+    ]);
+
+    const entries = [];
+
+    for (const inv of invoices) {
+      const isSale = inv.voucher_type === 'SALE';
+      const isSaleReturn = inv.voucher_type === 'SALE_RETURN';
+      entries.push({
+        created_at: inv.created_at,
+        time: new Date(inv.created_at).toTimeString().slice(0, 5),
+        type: inv.voucher_type,
+        reference: inv.invoice_number,
+        party: inv.customer?.name || inv.supplier?.name || '—',
+        amount: inv.total_amount,
+        dr: (isSale || inv.voucher_type === 'PURCHASE_RETURN') ? inv.total_amount : 0,
+        cr: (isSaleReturn || inv.voucher_type === 'PURCHASE') ? inv.total_amount : 0,
+      });
+    }
+
+    for (const pmt of payments) {
+      // RECEIVED = customer paid us (cash in), PAID = we paid supplier (cash out)
+      const isReceipt = pmt.payment_type === 'RECEIVED';
+      entries.push({
+        created_at: pmt.created_at,
+        time: new Date(pmt.created_at).toTimeString().slice(0, 5),
+        type: isReceipt ? 'RECEIPT' : 'PAYMENT',
+        reference: pmt.reference_number || '—',
+        party: pmt.customer?.name || pmt.supplier?.name || '—',
+        amount: pmt.amount,
+        dr: isReceipt ? pmt.amount : 0,
+        cr: isReceipt ? 0 : pmt.amount,
+      });
+    }
+
+    for (const exp of expenses) {
+      entries.push({
+        created_at: exp.created_at,
+        time: new Date(exp.created_at).toTimeString().slice(0, 5),
+        type: 'EXPENSE',
+        reference: exp.category,
+        party: exp.description || exp.category,
+        amount: exp.amount,
+        dr: 0,
+        cr: exp.amount,
+      });
+    }
+
+    // Sort all entries chronologically
+    entries.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+
+    // Strip internal created_at from output
+    const outputEntries = entries.map(({ created_at, ...rest }) => rest); // eslint-disable-line no-unused-vars
+
+    const totals = {
+      total_sales:     invoices.filter(i => i.voucher_type === 'SALE').reduce((s, i) => s + i.total_amount, 0),
+      total_purchases: invoices.filter(i => i.voucher_type === 'PURCHASE').reduce((s, i) => s + i.total_amount, 0),
+      total_receipts:  payments.filter(p => p.payment_type === 'RECEIVED').reduce((s, p) => s + p.amount, 0),
+      total_payments:  payments.filter(p => p.payment_type !== 'RECEIVED').reduce((s, p) => s + p.amount, 0),
+      total_expenses:  expenses.reduce((s, e) => s + e.amount, 0),
+    };
+
+    return res.json({
+      date: targetDate.toISOString().split('T')[0],
+      entries: outputEntries,
+      totals,
+    });
+  } catch (err) {
+    console.error('Day book error:', err);
+    return res.status(500).json({ error: 'Failed to fetch day book' });
   }
 });
 
