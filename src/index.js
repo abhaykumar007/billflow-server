@@ -1,4 +1,4 @@
-// Loads .env.development locally, .env.production if present, falls back to process.env (Railway injects vars directly)
+// Loads .env.development locally; on Render, NODE_ENV=production and env vars are injected directly — no file needed
 require('dotenv').config({ path: `.env.${process.env.NODE_ENV || 'development'}` });
 const express = require('express');
 const cors = require('cors');
