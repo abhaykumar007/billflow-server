@@ -108,6 +108,11 @@ router.post('/', async (req, res) => {
 
     if (!name || !name.trim()) return res.status(400).json({ error: 'Product name is required' });
 
+    const duplicate = await prisma.product.findFirst({
+      where: { business_id: businessId, name: { equals: name.trim(), mode: 'insensitive' }, is_deleted: false },
+    });
+    if (duplicate) return res.status(409).json({ error: `A product named "${duplicate.name}" already exists` });
+
     const product = await prisma.product.create({
       data: {
         business_id: businessId,
@@ -159,6 +164,13 @@ router.put('/:id', async (req, res) => {
 
     if (name !== undefined && !name.trim()) {
       return res.status(400).json({ error: 'Product name cannot be empty' });
+    }
+
+    if (name !== undefined) {
+      const duplicate = await prisma.product.findFirst({
+        where: { business_id: businessId, name: { equals: name.trim(), mode: 'insensitive' }, is_deleted: false, NOT: { id: req.params.id } },
+      });
+      if (duplicate) return res.status(409).json({ error: `A product named "${duplicate.name}" already exists` });
     }
 
     const updated = await prisma.product.update({
