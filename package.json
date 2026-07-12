@@ -7,12 +7,15 @@
     "node": ">=20.0.0"
   },
   "scripts": {
+    "start:local": "dotenv -e .env.local -- nodemon src/index.js",
+    "docker:up": "docker start billflow-db",
+    "docker:down": "docker stop billflow-db",
     "dev": "nodemon src/index.js",
     "build": "node_modules/.bin/prisma generate",
     "start": "node_modules/.bin/prisma migrate deploy && node src/index.js",
-    "prisma:migrate": "dotenv -e .env.development -- prisma migrate dev",
-    "prisma:generate": "dotenv -e .env.development -- prisma generate",
-    "prisma:studio": "dotenv -e .env.development -- prisma studio"
+    "prisma:migrate": "dotenv -e .env.local -- prisma migrate dev",
+    "prisma:generate": "dotenv -e .env.local -- prisma generate",
+    "prisma:studio": "dotenv -e .env.local -- prisma studio"
   },
   "keywords": [],
   "author": "",
