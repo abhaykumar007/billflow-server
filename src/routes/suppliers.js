@@ -1,7 +1,11 @@
 const express = require('express');
 const router = express.Router();
 const prisma = require('../utils/prisma');
-const { authenticateToken } = require('../middleware/auth');
+const { authenticateToken, requireRole, MANAGERS } = require('../middleware/auth');
+const { HttpError } = require('../utils/httpError');
+const { parseParty, rupeesToPaise, pageParams } = require('../utils/validate');
+const { parseDayStart, parseDayEnd, todayDate } = require('../utils/time');
+const { postSupplierEntry, getActiveFY } = require('../utils/ledger');
 
 router.use(authenticateToken);
 
@@ -9,8 +13,8 @@ router.use(authenticateToken);
 router.get('/', async (req, res) => {
   try {
     const businessId = req.user.businessId;
-    const { search = '', page = 1, limit = 50 } = req.query;
-    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const { search = '' } = req.query;
+    const { page, limit, skip } = pageParams(req.query);
 
     const where = {
       business_id: businessId,
@@ -31,7 +35,7 @@ router.get('/', async (req, res) => {
         where,
         orderBy: { name: 'asc' },
         skip,
-        take: parseInt(limit),
+        take: limit,
         select: {
           id: true,
           name: true,
@@ -49,7 +53,7 @@ router.get('/', async (req, res) => {
       prisma.supplier.count({ where }),
     ]);
 
-    return res.json({ suppliers, total, page: parseInt(page), limit: parseInt(limit) });
+    return res.json({ suppliers, total, page, limit });
   } catch (err) {
     console.error('List suppliers error:', err);
     return res.status(500).json({ error: 'Failed to fetch suppliers' });
@@ -65,15 +69,19 @@ router.get('/:id', async (req, res) => {
     });
     if (!supplier) return res.status(404).json({ error: 'Supplier not found' });
 
-    // Aggregate from supplier ledger entries
-    const ledgerAgg = await prisma.supplierLedgerEntry.aggregate({
-      where: { supplier_id: supplier.id, business_id: businessId },
-      _sum: { debit: true, credit: true },
-    });
+    // Payable = balance in the CURRENT financial year, which already includes everything
+    // carried forward. Summing every year would count carried-forward balances twice.
+    const activeFy = await getActiveFY(prisma, businessId);
+    const ledgerAgg = activeFy
+      ? await prisma.supplierLedgerEntry.aggregate({
+          where: { supplier_id: supplier.id, business_id: businessId, financial_year_id: activeFy.id },
+          _sum: { debit: true, credit: true },
+        })
+      : { _sum: {} };
 
     const totalDebit = ledgerAgg._sum.debit || 0;
     const totalCredit = ledgerAgg._sum.credit || 0;
-    // For suppliers: CR means you owe them (credit > debit = payable)
+    // For suppliers: credit > debit means we owe them (payable)
     const payable = totalCredit - totalDebit;
 
     return res.json({
@@ -91,12 +99,12 @@ router.get('/:id', async (req, res) => {
   }
 });
 
-// GET /api/suppliers/:id/ledger — transaction history
+// GET /api/suppliers/:id/ledger — transaction history, running balance recomputed
 router.get('/:id/ledger', async (req, res) => {
   try {
     const businessId = req.user.businessId;
-    const { from, to, page = 1, limit = 50 } = req.query;
-    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const { from, to } = req.query;
+    const { page, limit, skip } = pageParams(req.query);
 
     const supplier = await prisma.supplier.findFirst({
       where: { id: req.params.id, business_id: businessId, is_deleted: false },
@@ -104,30 +112,35 @@ router.get('/:id/ledger', async (req, res) => {
     });
     if (!supplier) return res.status(404).json({ error: 'Supplier not found' });
 
+    const fyId = req.headers['x-financial-year-id'];
+    const base = { supplier_id: req.params.id, business_id: businessId, ...(fyId ? { financial_year_id: fyId } : {}) };
     const where = {
-      supplier_id: req.params.id,
-      business_id: businessId,
+      ...base,
       ...(from || to
-        ? {
-            entry_date: {
-              ...(from ? { gte: new Date(from) } : {}),
-              ...(to ? { lte: new Date(to) } : {}),
-            },
-          }
+        ? { entry_date: { ...(from ? { gte: parseDayStart(from) } : {}), ...(to ? { lte: parseDayEnd(to) } : {}) } }
         : {}),
     };
 
-    const [entries, total] = await Promise.all([
-      prisma.supplierLedgerEntry.findMany({
-        where,
-        orderBy: { entry_date: 'asc' },
-        skip,
-        take: parseInt(limit),
-      }),
+    let opening = 0;
+    if (from) {
+      const before = await prisma.supplierLedgerEntry.aggregate({
+        where: { ...base, entry_date: { lt: parseDayStart(from) } },
+        _sum: { debit: true, credit: true },
+      });
+      opening = (before._sum.credit || 0) - (before._sum.debit || 0);
+    }
+
+    const [all, total] = await Promise.all([
+      prisma.supplierLedgerEntry.findMany({ where, orderBy: [{ entry_date: 'asc' }, { created_at: 'asc' }, { id: 'asc' }] }),
       prisma.supplierLedgerEntry.count({ where }),
     ]);
+    let running = opening;
+    const withBalance = all.map((e) => {
+      running += e.credit - e.debit;
+      return { ...e, balance: running };
+    });
 
-    return res.json({ entries, total, page: parseInt(page), limit: parseInt(limit) });
+    return res.json({ entries: withBalance.slice(skip, skip + limit), total, page, limit });
   } catch (err) {
     console.error('Supplier ledger error:', err);
     return res.status(500).json({ error: 'Failed to fetch ledger' });
@@ -138,8 +151,7 @@ router.get('/:id/ledger', async (req, res) => {
 router.get('/:id/invoices', async (req, res) => {
   try {
     const businessId = req.user.businessId;
-    const { limit = 50, page = 1 } = req.query;
-    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const { page, limit, skip } = pageParams(req.query);
 
     const supplier = await prisma.supplier.findFirst({
       where: { id: req.params.id, business_id: businessId, is_deleted: false },
@@ -159,7 +171,7 @@ router.get('/:id/invoices', async (req, res) => {
         where,
         orderBy: { invoice_date: 'desc' },
         skip,
-        take: parseInt(limit),
+        take: limit,
         select: {
           id: true,
           invoice_number: true,
@@ -173,7 +185,7 @@ router.get('/:id/invoices', async (req, res) => {
       prisma.invoice.count({ where }),
     ]);
 
-    return res.json({ invoices, total, page: parseInt(page), limit: parseInt(limit) });
+    return res.json({ invoices, total, page, limit });
   } catch (err) {
     console.error('Supplier invoices error:', err);
     return res.status(500).json({ error: 'Failed to fetch invoices' });
@@ -182,108 +194,51 @@ router.get('/:id/invoices', async (req, res) => {
 
 // POST /api/suppliers — create
 router.post('/', async (req, res) => {
-  try {
-    const businessId = req.user.businessId;
-    const {
-      name,
-      phone,
-      email,
-      address,
-      city,
-      state,
-      pincode,
-      gstin,
-      pan,
-      opening_balance = 0,
-      balance_type = 'CR',
-    } = req.body;
+  const businessId = req.user.businessId;
+  const fields = parseParty(req.body);
+  const balanceType = req.body.balance_type === 'DR' ? 'DR' : 'CR';
+  if (req.body.balance_type && !['DR', 'CR'].includes(req.body.balance_type)) {
+    throw new HttpError(400, "balance_type must be 'DR' or 'CR'", 'VALIDATION');
+  }
+  const openingPaise = rupeesToPaise(req.body.opening_balance, 'opening balance');
 
-    if (!name) return res.status(400).json({ error: 'Name is required' });
-
-    const supplier = await prisma.supplier.create({
-      data: {
-        business_id: businessId,
-        name: name.trim(),
-        phone: phone?.trim() || null,
-        email: email?.trim() || null,
-        address: address?.trim() || null,
-        city: city?.trim() || null,
-        state: state?.trim() || null,
-        pincode: pincode?.trim() || null,
-        gstin: gstin?.trim() || null,
-        pan: pan?.trim() || null,
-        opening_balance: Math.round((parseFloat(opening_balance) || 0) * 100),
-        balance_type,
-      },
+  const supplier = await prisma.$transaction(async (tx) => {
+    const created = await tx.supplier.create({
+      data: { business_id: businessId, ...fields, opening_balance: openingPaise, balance_type: balanceType },
     });
 
-    // Create opening balance ledger entry if non-zero
-    const obAmount = parseFloat(opening_balance) || 0;
-    if (obAmount !== 0) {
-      await prisma.supplierLedgerEntry.create({
-        data: {
-          business_id: businessId,
-          supplier_id: supplier.id,
-          entry_type: 'adjustment',
-          reference_id: supplier.id,
-          reference_type: 'opening_balance',
-          // CR balance_type means you owe them → credit entry
-          debit: balance_type === 'DR' ? Math.round(obAmount * 100) : 0,
-          credit: balance_type === 'CR' ? Math.round(obAmount * 100) : 0,
-          balance: balance_type === 'CR' ? -Math.round(obAmount * 100) : Math.round(obAmount * 100),
-          narration: 'Opening balance',
-          entry_date: new Date(),
-        },
+    // CR = we owe the supplier = a CREDIT line; the supplier ledger is positive when payable.
+    if (openingPaise > 0) {
+      const fy = await getActiveFY(tx, businessId);
+      await postSupplierEntry(tx, {
+        businessId, supplierId: created.id, fyId: fy?.id || null,
+        debit: balanceType === 'DR' ? openingPaise : 0,
+        credit: balanceType === 'CR' ? openingPaise : 0,
+        entryType: 'adjustment', referenceId: created.id, referenceType: 'opening_balance',
+        narration: 'Opening balance', entryDate: fy ? (todayDate() < fy.start_date ? fy.start_date : todayDate()) : todayDate(),
       });
     }
+    return created;
+  });
 
-    return res.status(201).json(supplier);
-  } catch (err) {
-    console.error('Create supplier error:', err);
-    const msg = process.env.NODE_ENV === 'development' ? err.message : 'Failed to create supplier';
-    return res.status(500).json({ error: msg });
-  }
+  return res.status(201).json(supplier);
 });
 
 // PUT /api/suppliers/:id — update
 router.put('/:id', async (req, res) => {
-  try {
-    const businessId = req.user.businessId;
-    const existing = await prisma.supplier.findFirst({
-      where: { id: req.params.id, business_id: businessId, is_deleted: false },
-    });
-    if (!existing) return res.status(404).json({ error: 'Supplier not found' });
+  const businessId = req.user.businessId;
+  const existing = await prisma.supplier.findFirst({
+    where: { id: req.params.id, business_id: businessId, is_deleted: false },
+  });
+  if (!existing) return res.status(404).json({ error: 'Supplier not found' });
 
-    const { name, phone, email, address, city, state, pincode, gstin, pan } = req.body;
-
-    if (name !== undefined && !name.trim()) {
-      return res.status(400).json({ error: 'Name cannot be empty' });
-    }
-
-    const updated = await prisma.supplier.update({
-      where: { id: req.params.id },
-      data: {
-        ...(name !== undefined && { name: name.trim() }),
-        ...(phone !== undefined && { phone: phone.trim() || null }),
-        ...(email !== undefined && { email: email.trim() || null }),
-        ...(address !== undefined && { address: address.trim() || null }),
-        ...(city !== undefined && { city: city.trim() || null }),
-        ...(state !== undefined && { state: state.trim() || null }),
-        ...(pincode !== undefined && { pincode: pincode.trim() || null }),
-        ...(gstin !== undefined && { gstin: gstin.trim() || null }),
-        ...(pan !== undefined && { pan: pan.trim() || null }),
-      },
-    });
-
-    return res.json(updated);
-  } catch (err) {
-    console.error('Update supplier error:', err);
-    return res.status(500).json({ error: 'Failed to update supplier' });
-  }
+  const fields = parseParty(req.body, { partial: true });
+  const updated = await prisma.supplier.update({ where: { id: req.params.id }, data: fields });
+  return res.json(updated);
 });
 
 // DELETE /api/suppliers/:id — soft delete
-router.delete('/:id', async (req, res) => {
+router.delete('/:id', requireRole(...MANAGERS), async (req, res) => {
   try {
     const businessId = req.user.businessId;
     const supplier = await prisma.supplier.findFirst({
@@ -292,8 +247,9 @@ router.delete('/:id', async (req, res) => {
     if (!supplier) return res.status(404).json({ error: 'Supplier not found' });
 
     // Block delete if supplier has outstanding payable
+    const activeFy = await getActiveFY(prisma, businessId);
     const ledgerAgg = await prisma.supplierLedgerEntry.aggregate({
-      where: { supplier_id: req.params.id, business_id: businessId },
+      where: { supplier_id: req.params.id, business_id: businessId, ...(activeFy ? { financial_year_id: activeFy.id } : {}) },
       _sum: { debit: true, credit: true },
     });
     const payable = (ledgerAgg._sum.credit || 0) - (ledgerAgg._sum.debit || 0);

@@ -15,7 +15,9 @@
     "start": "node_modules/.bin/prisma migrate deploy && node src/index.js",
     "prisma:migrate": "dotenv -e .env.local -- prisma migrate dev",
     "prisma:generate": "dotenv -e .env.local -- prisma generate",
-    "prisma:studio": "dotenv -e .env.local -- prisma studio"
+    "prisma:studio": "dotenv -e .env.local -- prisma studio",
+    "test": "node --test \"test/*.test.js\"",
+    "repair:ledgers": "node scripts/repair-ledgers.js"
   },
   "keywords": [],
   "author": "",
@@ -27,7 +29,10 @@
     "cors": "^2.8.6",
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
+    "express-rate-limit": "^8.7.1",
+    "helmet": "^8.3.0",
     "jsonwebtoken": "^9.0.3",
+    "nodemailer": "^10.2.1",
     "pg": "^8.20.0",
     "prisma": "^5.22.0",
     "razorpay": "^2.9.6"

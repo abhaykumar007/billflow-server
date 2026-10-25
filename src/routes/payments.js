@@ -1,505 +1,412 @@
 const express = require('express');
 const router = express.Router();
 const prisma = require('../utils/prisma');
-const { authenticateToken } = require('../middleware/auth');
+const { authenticateToken, requireRole, MANAGERS } = require('../middleware/auth');
 const { attachFinancialYear, requireUnlockedFY, enforceOpenYear } = require('../middleware/financialYear');
+const { HttpError } = require('../utils/httpError');
+const { lockRow, lockRows } = require('../utils/lock');
+const { parsePaise } = require('../utils/money');
+const { parseDayStart, parseDayEnd, isValidDate, todayDate } = require('../utils/time');
+const {
+  postCustomerEntry, postSupplierEntry, VOUCHERS,
+  assertDateInFY, getActiveFY, assertFyWritable, assertCanPost, idempotencyKey,
+} = require('../utils/ledger');
 
 router.use(authenticateToken);
 
-// POST /api/payments — record a payment (regular against invoice, or advance on-account)
-router.post('/', attachFinancialYear, enforceOpenYear, requireUnlockedFY, async (req, res) => {
-  const {
-    invoice_id,
-    customer_id,
-    supplier_id,
+const MODE_RE = /^[a-z_]{2,20}$/;
+
+function parseMode(mode) {
+  const m = String(mode || 'cash').trim().toLowerCase();
+  if (!MODE_RE.test(m)) throw new HttpError(400, 'Invalid payment_mode', 'VALIDATION');
+  return m;
+}
+
+// Validates the shared body fields and returns normalised values
+function parsePaymentBody(body) {
+  const amount = parsePaise(body.amount, 'amount');
+  let splits = null;
+  if (Array.isArray(body.splits) && body.splits.length > 0) {
+    splits = body.splits.map((s) => ({ payment_mode: parseMode(s.payment_mode), amount: parsePaise(s.amount, 'split amount') }));
+    const total = splits.reduce((sum, s) => sum + s.amount, 0);
+    if (total !== amount) {
+      throw new HttpError(400, `Split amounts (${total} paise) must equal total amount (${amount} paise)`, 'VALIDATION');
+    }
+  }
+  const paymentDate = body.payment_date ? parseDayStart(body.payment_date) : todayDate();
+  if (!isValidDate(paymentDate)) throw new HttpError(400, 'Invalid payment_date', 'VALIDATION');
+  return {
     amount,
-    payment_mode,
-    payment_date,
-    reference_number,
-    notes,
-    advance_payment,
     splits,
-  } = req.body;
+    paymentDate,
+    mode: splits ? null : parseMode(body.payment_mode),
+    reference: body.reference_number ? String(body.reference_number).slice(0, 100) : null,
+    notes: body.notes ? String(body.notes).slice(0, 500) : null,
+  };
+}
+
+async function resolveBankAccount(tx, businessId, bankAccountId) {
+  if (!bankAccountId) return null;
+  const acc = await tx.bankAccount.findFirst({
+    where: { id: bankAccountId, business_id: businessId, is_deleted: false, is_active: true },
+    select: { id: true },
+  });
+  if (!acc) throw new HttpError(404, 'Bank account not found', 'NOT_FOUND');
+  return acc.id;
+}
+
+// POST /api/payments - record a payment against an invoice, or an advance / on-account payment
+router.post('/', attachFinancialYear, enforceOpenYear, requireUnlockedFY, async (req, res) => {
   const businessId = req.user.businessId;
+  const fy = req.financialYear;
+  await assertCanPost(prisma, fy);
 
-  if (!amount || amount <= 0) {
-    return res.status(400).json({ error: 'A positive amount is required' });
+  const p = parsePaymentBody(req.body);
+  assertDateInFY(p.paymentDate, fy);
+  const key = idempotencyKey(req);
+  const isAdvance = !!req.body.advance_payment;
+
+  if (key) {
+    const dup = await prisma.payment.findFirst({ where: { business_id: businessId, idempotency_key: key }, include: { splits: true } });
+    if (dup) return res.status(200).json({ ...dup, idempotent_replay: true });
   }
 
-  // Validate splits if provided
-  if (splits && splits.length > 0) {
-    const invalidSplit = splits.find(s => !s.payment_mode || !s.amount || s.amount <= 0);
-    if (invalidSplit) {
-      return res.status(400).json({ error: 'Each split must have payment_mode and a positive amount' });
-    }
-    const splitTotal = splits.reduce((sum, s) => sum + s.amount, 0);
-    if (splitTotal !== amount) {
-      return res.status(400).json({
-        error: `Split amounts (${splitTotal} paise) must equal total amount (${amount} paise)`,
-      });
-    }
-  }
+  const payment = await prisma.$transaction(async (tx) => {
+    const bankAccountId = await resolveBankAccount(tx, businessId, req.body.bank_account_id);
+    const modeLabel = p.mode || 'split';
 
-  const isAdvance = !!advance_payment;
-  const entryDate = payment_date ? new Date(payment_date) : new Date();
-  const fyId = req.financialYear?.id || null;
-  const resolvedMode = splits?.length > 0 ? null : (payment_mode || 'cash');
-
-  try {
+    let created;
     if (isAdvance) {
-      // ── Advance / on-account payment ────────────────────────────────────────
-      if (!customer_id && !supplier_id) {
-        return res.status(400).json({ error: 'customer_id or supplier_id is required for advance payment' });
-      }
-
+      // ── Advance / on-account payment ──────────────────────────────────────
+      const { customer_id, supplier_id } = req.body;
+      if (!customer_id && !supplier_id) throw new HttpError(400, 'customer_id or supplier_id is required for advance payment', 'VALIDATION');
+      if (customer_id && supplier_id) throw new HttpError(400, 'Provide either customer_id or supplier_id, not both', 'VALIDATION');
       const isSupplier = !!supplier_id;
-      const partyType = isSupplier ? 'SUPPLIER' : 'CUSTOMER';
-      const paymentType = isSupplier ? 'PAID' : 'RECEIVED';
 
-      const payment = await prisma.$transaction(async (tx) => {
-        const newPayment = await tx.payment.create({
-          data: {
-            business_id: businessId,
-            invoice_id: null,
-            customer_id: isSupplier ? null : customer_id,
-            supplier_id: isSupplier ? supplier_id : null,
-            party_type: partyType,
-            payment_type: paymentType,
-            amount,
-            payment_mode: resolvedMode,
-            payment_date: entryDate,
-            reference_number: reference_number || null,
-            notes: notes || null,
-            financial_year_id: fyId,
-            advance_payment: true,
-            advance_balance_remaining: amount,
-          },
-        });
+      if (isSupplier) {
+        const s = await tx.supplier.findFirst({ where: { id: supplier_id, business_id: businessId, is_deleted: false }, select: { id: true } });
+        if (!s) throw new HttpError(404, 'Supplier not found', 'NOT_FOUND');
+      } else {
+        const c = await tx.customer.findFirst({ where: { id: customer_id, business_id: businessId, is_deleted: false }, select: { id: true } });
+        if (!c) throw new HttpError(404, 'Customer not found', 'NOT_FOUND');
+      }
 
-        if (splits?.length > 0) {
-          await tx.paymentSplit.createMany({
-            data: splits.map(s => ({ payment_id: newPayment.id, payment_mode: s.payment_mode, amount: s.amount })),
-          });
-        }
-
-        // Ledger: credit customer (reduces receivable) or debit supplier (reduces payable)
-        if (!isSupplier) {
-          const lastEntry = await tx.ledgerEntry.findFirst({
-            where: { business_id: businessId, customer_id, financial_year_id: fyId },
-            orderBy: [{ created_at: 'desc' }, { id: 'desc' }],
-          });
-          const newBalance = (lastEntry?.balance || 0) - amount;
-          await tx.ledgerEntry.create({
-            data: {
-              business_id: businessId,
-              customer_id,
-              entry_type: 'advance',
-              reference_id: newPayment.id,
-              reference_type: 'advance_payment',
-              debit: 0,
-              credit: amount,
-              balance: newBalance,
-              narration: `Advance payment received via ${payment_mode || 'split'}`,
-              entry_date: entryDate,
-              financial_year_id: fyId,
-            },
-          });
-        } else {
-          const lastEntry = await tx.supplierLedgerEntry.findFirst({
-            where: { business_id: businessId, supplier_id, financial_year_id: fyId },
-            orderBy: [{ created_at: 'desc' }, { id: 'desc' }],
-          });
-          const newBalance = (lastEntry?.balance || 0) - amount;
-          await tx.supplierLedgerEntry.create({
-            data: {
-              business_id: businessId,
-              supplier_id,
-              financial_year_id: fyId,
-              entry_type: 'advance',
-              reference_id: newPayment.id,
-              reference_type: 'advance_payment',
-              debit: amount,
-              credit: 0,
-              balance: newBalance,
-              narration: `Advance payment made via ${payment_mode || 'split'}`,
-              entry_date: entryDate,
-            },
-          });
-        }
-
-        return newPayment;
+      created = await tx.payment.create({
+        data: {
+          business_id: businessId,
+          invoice_id: null,
+          customer_id: isSupplier ? null : customer_id,
+          supplier_id: isSupplier ? supplier_id : null,
+          bank_account_id: bankAccountId,
+          party_type: isSupplier ? 'SUPPLIER' : 'CUSTOMER',
+          payment_type: isSupplier ? 'PAID' : 'RECEIVED',
+          amount: p.amount,
+          payment_mode: p.mode,
+          payment_date: p.paymentDate,
+          reference_number: p.reference,
+          notes: p.notes,
+          financial_year_id: fy.id,
+          advance_payment: true,
+          advance_balance_remaining: p.amount,
+          idempotency_key: key,
+        },
       });
 
-      return res.status(201).json(payment);
+      if (isSupplier) {
+        await postSupplierEntry(tx, {
+          businessId, supplierId: supplier_id, fyId: fy.id, debit: p.amount, entryType: 'advance',
+          referenceId: created.id, referenceType: 'advance_payment',
+          narration: `Advance payment made via ${modeLabel}`, entryDate: p.paymentDate,
+        });
+      } else {
+        await postCustomerEntry(tx, {
+          businessId, customerId: customer_id, fyId: fy.id, credit: p.amount, entryType: 'advance',
+          referenceId: created.id, referenceType: 'advance_payment',
+          narration: `Advance payment received via ${modeLabel}`, entryDate: p.paymentDate,
+        });
+      }
     } else {
-      // ── Regular payment against an invoice ──────────────────────────────────
-      if (!invoice_id) {
-        return res.status(400).json({ error: 'invoice_id is required' });
-      }
+      // ── Regular payment against an invoice ────────────────────────────────
+      const { invoice_id } = req.body;
+      if (!invoice_id) throw new HttpError(400, 'invoice_id is required', 'VALIDATION');
 
-      const invoice = await prisma.invoice.findFirst({
-        where: { id: invoice_id, business_id: businessId, is_deleted: false },
-      });
-
-      if (!invoice) return res.status(404).json({ error: 'Invoice not found' });
+      await lockRow(tx, 'invoice', invoice_id);
+      const invoice = await tx.invoice.findFirst({ where: { id: invoice_id, business_id: businessId, is_deleted: false } });
+      if (!invoice) throw new HttpError(404, 'Invoice not found', 'NOT_FOUND');
+      const v = VOUCHERS[invoice.voucher_type];
+      if (!v) throw new HttpError(400, 'Payments cannot be recorded against estimates', 'VALIDATION');
       if (['draft', 'cancelled', 'paid'].includes(invoice.status)) {
-        return res.status(400).json({ error: `Cannot record payment on a ${invoice.status} invoice` });
+        throw new HttpError(400, `Cannot record payment on a ${invoice.status} invoice`, 'VALIDATION');
       }
-      if (amount > invoice.balance_due) {
-        return res.status(400).json({ error: `Amount exceeds balance due (${invoice.balance_due} paise)` });
+      // read inside the lock, so two concurrent payments cannot both pass this check
+      if (p.amount > invoice.balance_due) {
+        throw new HttpError(400, `Amount exceeds balance due (${invoice.balance_due} paise)`, 'OVERPAYMENT');
+      }
+      if (p.paymentDate.getTime() < invoice.invoice_date.getTime() - 24 * 3600 * 1000) {
+        throw new HttpError(400, 'Payment date cannot be before the invoice date', 'VALIDATION');
       }
 
-      const isSupplierInvoice = ['PURCHASE', 'PURCHASE_RETURN'].includes(invoice.voucher_type);
-      const partyType = isSupplierInvoice ? 'SUPPLIER' : 'CUSTOMER';
-      const paymentType = isSupplierInvoice ? 'PAID' : 'RECEIVED';
-
-      const payment = await prisma.$transaction(async (tx) => {
-        const newPayment = await tx.payment.create({
-          data: {
-            business_id: businessId,
-            invoice_id,
-            customer_id: isSupplierInvoice ? null : invoice.customer_id,
-            supplier_id: isSupplierInvoice ? invoice.supplier_id : null,
-            party_type: partyType,
-            payment_type: paymentType,
-            amount,
-            payment_mode: resolvedMode,
-            payment_date: entryDate,
-            reference_number: reference_number || null,
-            notes: notes || null,
-            financial_year_id: fyId,
-          },
-        });
-
-        if (splits?.length > 0) {
-          await tx.paymentSplit.createMany({
-            data: splits.map(s => ({ payment_id: newPayment.id, payment_mode: s.payment_mode, amount: s.amount })),
-          });
-        }
-
-        const newAmountPaid = invoice.amount_paid + amount;
-        const newBalanceDue = invoice.total_amount - newAmountPaid;
-        const newStatus = newBalanceDue <= 0 ? 'paid' : 'partial';
-
-        await tx.invoice.update({
-          where: { id: invoice_id },
-          data: { amount_paid: newAmountPaid, balance_due: newBalanceDue, status: newStatus },
-        });
-
-        if (isSupplierInvoice) {
-          const lastEntry = await tx.supplierLedgerEntry.findFirst({
-            where: { business_id: businessId, supplier_id: invoice.supplier_id, financial_year_id: fyId },
-            orderBy: [{ created_at: 'desc' }, { id: 'desc' }],
-          });
-          const newBalance = (lastEntry?.balance || 0) - amount;
-          await tx.supplierLedgerEntry.create({
-            data: {
-              business_id: businessId,
-              supplier_id: invoice.supplier_id,
-              financial_year_id: fyId,
-              entry_type: 'payment',
-              reference_id: newPayment.id,
-              reference_type: 'payment',
-              debit: amount,
-              credit: 0,
-              balance: newBalance,
-              narration: `Payment made for ${invoice.invoice_number} via ${payment_mode || 'split'}`,
-              entry_date: entryDate,
-            },
-          });
-        } else {
-          const lastEntry = await tx.ledgerEntry.findFirst({
-            where: { business_id: businessId, customer_id: invoice.customer_id, financial_year_id: fyId },
-            orderBy: [{ created_at: 'desc' }, { id: 'desc' }],
-          });
-          const newBalance = (lastEntry?.balance || 0) - amount;
-          await tx.ledgerEntry.create({
-            data: {
-              business_id: businessId,
-              customer_id: invoice.customer_id,
-              entry_type: 'payment',
-              reference_id: newPayment.id,
-              reference_type: 'payment',
-              debit: 0,
-              credit: amount,
-              balance: newBalance,
-              narration: `Payment received for ${invoice.invoice_number} via ${payment_mode || 'split'}`,
-              entry_date: entryDate,
-              financial_year_id: fyId,
-            },
-          });
-        }
-
-        return newPayment;
+      const isSupplier = v.party === 'SUPPLIER';
+      created = await tx.payment.create({
+        data: {
+          business_id: businessId,
+          invoice_id,
+          customer_id: isSupplier ? null : invoice.customer_id,
+          supplier_id: isSupplier ? invoice.supplier_id : null,
+          bank_account_id: bankAccountId,
+          party_type: v.party,
+          payment_type: v.settleType,
+          amount: p.amount,
+          payment_mode: p.mode,
+          payment_date: p.paymentDate,
+          reference_number: p.reference,
+          notes: p.notes,
+          financial_year_id: fy.id,
+          idempotency_key: key,
+        },
       });
 
-      return res.status(201).json(payment);
+      const newAmountPaid = invoice.amount_paid + p.amount;
+      const newBalanceDue = invoice.total_amount - newAmountPaid;
+      await tx.invoice.update({
+        where: { id: invoice_id },
+        data: { amount_paid: newAmountPaid, balance_due: newBalanceDue, status: newBalanceDue <= 0 ? 'paid' : 'partial' },
+      });
+
+      const narrationBase = {
+        SALE: `Payment received for ${invoice.invoice_number}`,
+        SALE_RETURN: `Refund paid against ${invoice.invoice_number}`,
+        PURCHASE: `Payment made for ${invoice.invoice_number}`,
+        PURCHASE_RETURN: `Refund received against ${invoice.invoice_number}`,
+      }[invoice.voucher_type];
+      const entry = {
+        businessId, fyId: fy.id, entryType: 'payment', referenceId: created.id, referenceType: 'payment',
+        narration: `${narrationBase} via ${modeLabel}`, entryDate: p.paymentDate,
+        [v.settleSide]: p.amount,
+      };
+      if (isSupplier) await postSupplierEntry(tx, { ...entry, supplierId: invoice.supplier_id });
+      else await postCustomerEntry(tx, { ...entry, customerId: invoice.customer_id });
     }
-  } catch (err) {
-    console.error('Payment error:', err);
-    return res.status(500).json({ error: 'Failed to record payment' });
-  }
+
+    if (p.splits) {
+      await tx.paymentSplit.createMany({ data: p.splits.map((s) => ({ payment_id: created.id, ...s })) });
+    }
+    return created;
+  });
+
+  return res.status(201).json(payment);
 });
 
-// GET /api/payments — list payments with optional filters
+// GET /api/payments - list payments with optional filters
 router.get('/', async (req, res) => {
-  const {
-    customer_id,
-    supplier_id,
-    party_type,
-    from,
-    to,
-    mode,
-    advance_only,
-    limit = 50,
-    offset = 0,
-  } = req.query;
+  const { customer_id, supplier_id, party_type, payment_type, from, to, mode, advance_only } = req.query;
+  const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 200);
+  const offset = Math.max(parseInt(req.query.offset) || 0, 0);
   const businessId = req.user.businessId;
 
   const where = { business_id: businessId, is_reversed: false };
   if (customer_id) where.customer_id = customer_id;
   if (supplier_id) where.supplier_id = supplier_id;
   if (party_type) where.party_type = party_type;
+  if (payment_type) where.payment_type = payment_type;
   if (mode) where.payment_mode = mode;
   if (advance_only === 'true') where.advance_payment = true;
   if (from || to) {
     where.payment_date = {};
-    if (from) where.payment_date.gte = new Date(from);
-    if (to) where.payment_date.lte = new Date(to + 'T23:59:59');
+    if (from) where.payment_date.gte = parseDayStart(from);
+    if (to) where.payment_date.lte = parseDayEnd(to);
   }
 
-  try {
-    const [payments, total] = await Promise.all([
-      prisma.payment.findMany({
-        where,
-        include: {
-          customer: { select: { id: true, name: true } },
-          supplier: { select: { id: true, name: true } },
-          invoice: { select: { id: true, invoice_number: true, voucher_type: true } },
-          splits: true,
-        },
-        orderBy: { payment_date: 'desc' },
-        take: parseInt(limit),
-        skip: parseInt(offset),
-      }),
-      prisma.payment.count({ where }),
-    ]);
-
-    return res.json({ payments, total });
-  } catch (err) {
-    console.error('Payments list error:', err);
-    return res.status(500).json({ error: 'Failed to fetch payments' });
-  }
-});
-
-// GET /api/payments/advance-balance/:customerId — total unused advance for a customer
-router.get('/advance-balance/:customerId', async (req, res) => {
-  const { customerId } = req.params;
-  const businessId = req.user.businessId;
-
-  try {
-    const result = await prisma.payment.aggregate({
-      where: {
-        business_id: businessId,
-        customer_id: customerId,
-        advance_payment: true,
-        is_reversed: false,
+  const [payments, total] = await Promise.all([
+    prisma.payment.findMany({
+      where,
+      include: {
+        customer: { select: { id: true, name: true } },
+        supplier: { select: { id: true, name: true } },
+        invoice: { select: { id: true, invoice_number: true, voucher_type: true } },
+        bankAccount: { select: { id: true, account_name: true } },
+        splits: true,
       },
-      _sum: { advance_balance_remaining: true },
-    });
-
-    return res.json({ advance_balance_remaining: result._sum.advance_balance_remaining || 0 });
-  } catch (err) {
-    console.error('Advance balance error:', err);
-    return res.status(500).json({ error: 'Failed to fetch advance balance' });
-  }
+      orderBy: [{ payment_date: 'desc' }, { created_at: 'desc' }],
+      take: limit,
+      skip: offset,
+    }),
+    prisma.payment.count({ where }),
+  ]);
+  return res.json({ payments, total });
 });
 
-// POST /api/payments/adjust-advance — apply customer advance balance to an invoice
+// GET /api/payments/advance-balance/:customerId - unused advance for a customer
+router.get('/advance-balance/:customerId', async (req, res) => {
+  const result = await prisma.payment.aggregate({
+    where: {
+      business_id: req.user.businessId,
+      customer_id: req.params.customerId,
+      advance_payment: true,
+      is_reversed: false,
+    },
+    _sum: { advance_balance_remaining: true },
+  });
+  return res.json({ advance_balance_remaining: result._sum.advance_balance_remaining || 0 });
+});
+
+// GET /api/payments/advance-balance/supplier/:supplierId
+router.get('/advance-balance/supplier/:supplierId', async (req, res) => {
+  const result = await prisma.payment.aggregate({
+    where: {
+      business_id: req.user.businessId,
+      supplier_id: req.params.supplierId,
+      advance_payment: true,
+      is_reversed: false,
+    },
+    _sum: { advance_balance_remaining: true },
+  });
+  return res.json({ advance_balance_remaining: result._sum.advance_balance_remaining || 0 });
+});
+
+// POST /api/payments/adjust-advance - apply a party's advance balance to one of its invoices.
+// An advance is already on the ledger (credited when received), so applying it only
+// settles the invoice; the ledger gets an informational zero-amount line, never a second credit.
 router.post('/adjust-advance', attachFinancialYear, enforceOpenYear, requireUnlockedFY, async (req, res) => {
-  const { customer_id, invoice_id, amount } = req.body;
   const businessId = req.user.businessId;
+  const fy = req.financialYear;
+  await assertCanPost(prisma, fy);
 
-  if (!customer_id || !invoice_id || !amount || amount <= 0) {
-    return res.status(400).json({ error: 'customer_id, invoice_id, and a positive amount are required' });
-  }
+  const { invoice_id } = req.body;
+  if (!invoice_id) throw new HttpError(400, 'invoice_id is required', 'VALIDATION');
+  const amount = parsePaise(req.body.amount, 'amount');
 
-  try {
-    const invoice = await prisma.invoice.findFirst({
-      where: { id: invoice_id, business_id: businessId, is_deleted: false },
-    });
-
-    if (!invoice) return res.status(404).json({ error: 'Invoice not found' });
+  await prisma.$transaction(async (tx) => {
+    await lockRow(tx, 'invoice', invoice_id);
+    const invoice = await tx.invoice.findFirst({ where: { id: invoice_id, business_id: businessId, is_deleted: false } });
+    if (!invoice) throw new HttpError(404, 'Invoice not found', 'NOT_FOUND');
+    if (!['SALE', 'PURCHASE'].includes(invoice.voucher_type)) {
+      throw new HttpError(400, 'Advances can only be applied to sale or purchase invoices', 'VALIDATION');
+    }
+    if (!['sent', 'partial'].includes(invoice.status)) {
+      throw new HttpError(400, `Cannot apply advance to a ${invoice.status} invoice`, 'VALIDATION');
+    }
     if (amount > invoice.balance_due) {
-      return res.status(400).json({ error: `Amount exceeds invoice balance due (${invoice.balance_due} paise)` });
+      throw new HttpError(400, `Amount exceeds invoice balance due (${invoice.balance_due} paise)`, 'OVERPAYMENT');
     }
 
-    // Find open advance payments oldest-first
-    const advances = await prisma.payment.findMany({
+    // the party always comes from the invoice, never from the request body
+    const isSupplier = invoice.voucher_type === 'PURCHASE';
+    const partyId = isSupplier ? invoice.supplier_id : invoice.customer_id;
+    await lockRow(tx, isSupplier ? 'supplier' : 'customer', partyId);
+
+    const advances = await tx.payment.findMany({
       where: {
         business_id: businessId,
-        customer_id,
+        ...(isSupplier ? { supplier_id: partyId } : { customer_id: partyId }),
         advance_payment: true,
         is_reversed: false,
         advance_balance_remaining: { gt: 0 },
       },
-      orderBy: { payment_date: 'asc' },
+      orderBy: [{ payment_date: 'asc' }, { created_at: 'asc' }],
     });
-
-    const totalAvailable = advances.reduce((sum, a) => sum + a.advance_balance_remaining, 0);
+    const totalAvailable = advances.reduce((s, a) => s + a.advance_balance_remaining, 0);
     if (totalAvailable < amount) {
-      return res.status(400).json({
-        error: `Insufficient advance balance. Available: ${totalAvailable} paise, requested: ${amount} paise`,
-      });
+      throw new HttpError(400, `Insufficient advance balance. Available: ${totalAvailable} paise, requested: ${amount} paise`, 'INSUFFICIENT_ADVANCE');
     }
 
-    const fyId = req.financialYear?.id || null;
-    const entryDate = new Date();
+    let remaining = amount;
+    for (const adv of advances) {
+      if (remaining <= 0) break;
+      const deduct = Math.min(remaining, adv.advance_balance_remaining);
+      await tx.payment.update({ where: { id: adv.id }, data: { advance_balance_remaining: { decrement: deduct } } });
+      remaining -= deduct;
+    }
 
-    await prisma.$transaction(async (tx) => {
-      // Deduct from advances oldest-first
-      let remaining = amount;
-      for (const advance of advances) {
-        if (remaining <= 0) break;
-        const deduct = Math.min(remaining, advance.advance_balance_remaining);
-        await tx.payment.update({
-          where: { id: advance.id },
-          data: { advance_balance_remaining: advance.advance_balance_remaining - deduct },
-        });
-        remaining -= deduct;
-      }
-
-      // Apply to invoice
-      const newAmountPaid = invoice.amount_paid + amount;
-      const newBalanceDue = invoice.total_amount - newAmountPaid;
-      const newStatus = newBalanceDue <= 0 ? 'paid' : 'partial';
-      await tx.invoice.update({
-        where: { id: invoice_id },
-        data: { amount_paid: newAmountPaid, balance_due: newBalanceDue, status: newStatus },
-      });
-
-      // Ledger credit — advance applied reduces the customer's receivable balance
-      const lastEntry = await tx.ledgerEntry.findFirst({
-        where: { business_id: businessId, customer_id, financial_year_id: fyId },
-        orderBy: [{ created_at: 'desc' }, { id: 'desc' }],
-      });
-      const newBalance = (lastEntry?.balance || 0) - amount;
-      await tx.ledgerEntry.create({
-        data: {
-          business_id: businessId,
-          customer_id,
-          entry_type: 'advance_adjustment',
-          reference_id: invoice_id,
-          reference_type: 'advance_adjustment',
-          debit: 0,
-          credit: amount,
-          balance: newBalance,
-          narration: `Advance applied to ${invoice.invoice_number}`,
-          entry_date: entryDate,
-          financial_year_id: fyId,
-        },
-      });
+    const newAmountPaid = invoice.amount_paid + amount;
+    const newBalanceDue = invoice.total_amount - newAmountPaid;
+    await tx.invoice.update({
+      where: { id: invoice_id },
+      data: { amount_paid: newAmountPaid, balance_due: newBalanceDue, status: newBalanceDue <= 0 ? 'paid' : 'partial' },
     });
 
-    return res.json({ message: 'Advance applied successfully' });
-  } catch (err) {
-    console.error('Adjust advance error:', err);
-    return res.status(500).json({ error: 'Failed to apply advance' });
-  }
+    const entry = {
+      businessId, fyId: fy.id, debit: 0, credit: 0, entryType: 'advance_adjustment',
+      referenceId: invoice_id, referenceType: 'advance_adjustment',
+      narration: `Advance of Rs ${(amount / 100).toFixed(2)} applied to ${invoice.invoice_number}`,
+      entryDate: todayDate(),
+    };
+    if (isSupplier) await postSupplierEntry(tx, { ...entry, supplierId: partyId });
+    else await postCustomerEntry(tx, { ...entry, customerId: partyId });
+  });
+
+  return res.json({ message: 'Advance applied successfully' });
 });
 
-// DELETE /api/payments/:id — reverse a payment (append-only ledger reversal)
-router.delete('/:id', async (req, res) => {
+// DELETE /api/payments/:id - reverse a payment (append-only ledger reversal)
+router.delete('/:id', requireRole(...MANAGERS), async (req, res) => {
   const businessId = req.user.businessId;
-  const { reason } = req.body;
+  const reason = req.body?.reason ? String(req.body.reason).slice(0, 200) : null;
 
-  try {
-    const payment = await prisma.payment.findFirst({
+  await prisma.$transaction(async (tx) => {
+    await lockRow(tx, 'payment', req.params.id);
+    const payment = await tx.payment.findFirst({
       where: { id: req.params.id, business_id: businessId },
       include: { invoice: true },
     });
+    if (!payment) throw new HttpError(404, 'Payment not found', 'NOT_FOUND');
+    if (payment.is_reversed) throw new HttpError(400, 'Payment is already reversed', 'VALIDATION');
 
-    if (!payment) return res.status(404).json({ error: 'Payment not found' });
-    if (payment.is_reversed) return res.status(400).json({ error: 'Payment is already reversed' });
-
-    await prisma.$transaction(async (tx) => {
-      await tx.payment.update({
-        where: { id: payment.id },
-        data: {
-          is_reversed: true,
-          // Zero out remaining advance balance — it can no longer be applied
-          ...(payment.advance_payment && { advance_balance_remaining: 0 }),
-        },
-      });
-
-      const fyId = payment.financial_year_id || null;
-      const narration = payment.advance_payment
-        ? `Advance payment reversal${reason ? ` — ${reason}` : ''}`
-        : `Payment reversal for ${payment.invoice?.invoice_number}${reason ? ` — ${reason}` : ''}`;
-
-      // Only update the invoice for regular payments
-      if (!payment.advance_payment && payment.invoice) {
-        const invoice = payment.invoice;
-        const newAmountPaid = invoice.amount_paid - payment.amount;
-        const newBalanceDue = invoice.total_amount - newAmountPaid;
-        const newStatus = newAmountPaid <= 0 ? 'sent' : 'partial';
-
-        await tx.invoice.update({
-          where: { id: invoice.id },
-          data: { amount_paid: newAmountPaid, balance_due: newBalanceDue, status: newStatus },
-        });
+    // The reversal is an event of TODAY: it is posted to the current financial year,
+    // so closed / carried-forward years are never rewritten.
+    const activeFy = await getActiveFY(tx, businessId);
+    assertFyWritable(activeFy);
+    if (payment.financial_year_id && payment.financial_year_id !== activeFy.id) {
+      const payFy = await tx.financialYear.findUnique({ where: { id: payment.financial_year_id } });
+      if (payFy?.is_locked && !payFy.is_closed) {
+        throw new HttpError(423, 'This payment belongs to a locked financial year. Unlock it first.', 'FY_LOCKED');
       }
+    }
 
-      if (payment.party_type === 'SUPPLIER') {
-        const lastEntry = await tx.supplierLedgerEntry.findFirst({
-          where: { business_id: businessId, supplier_id: payment.supplier_id, financial_year_id: fyId },
-          orderBy: [{ created_at: 'desc' }, { id: 'desc' }],
-        });
-        const newBalance = (lastEntry?.balance || 0) + payment.amount;
-        await tx.supplierLedgerEntry.create({
-          data: {
-            business_id: businessId,
-            supplier_id: payment.supplier_id,
-            financial_year_id: fyId,
-            entry_type: 'adjustment',
-            reference_id: payment.id,
-            reference_type: 'payment_reversal',
-            debit: 0,
-            credit: payment.amount,
-            balance: newBalance,
-            narration,
-            entry_date: new Date(),
-          },
-        });
-      } else {
-        const lastEntry = await tx.ledgerEntry.findFirst({
-          where: { business_id: businessId, customer_id: payment.customer_id, financial_year_id: fyId },
-          orderBy: [{ created_at: 'desc' }, { id: 'desc' }],
-        });
-        const newBalance = (lastEntry?.balance || 0) + payment.amount;
-        await tx.ledgerEntry.create({
-          data: {
-            business_id: businessId,
-            customer_id: payment.customer_id,
-            entry_type: 'adjustment',
-            reference_id: payment.id,
-            reference_type: 'payment_reversal',
-            debit: payment.amount,
-            credit: 0,
-            balance: newBalance,
-            narration,
-            entry_date: new Date(),
-            financial_year_id: fyId,
-          },
-        });
-      }
+    if (payment.advance_payment && payment.advance_balance_remaining < payment.amount) {
+      throw new HttpError(409, 'Part of this advance has already been applied to invoices. Reverse those invoice payments first.', 'ADVANCE_PARTIALLY_USED');
+    }
+
+    await tx.payment.update({
+      where: { id: payment.id },
+      data: { is_reversed: true, ...(payment.advance_payment && { advance_balance_remaining: 0 }) },
     });
 
-    return res.json({ message: 'Payment reversed successfully' });
-  } catch (err) {
-    console.error('Payment reversal error:', err);
-    return res.status(500).json({ error: 'Failed to reverse payment' });
-  }
+    if (!payment.advance_payment && payment.invoice) {
+      await lockRow(tx, 'invoice', payment.invoice.id);
+      const invoice = await tx.invoice.findUnique({ where: { id: payment.invoice.id } });
+      const newAmountPaid = invoice.amount_paid - payment.amount;
+      const newBalanceDue = invoice.total_amount - newAmountPaid;
+      await tx.invoice.update({
+        where: { id: invoice.id },
+        data: {
+          amount_paid: newAmountPaid,
+          balance_due: newBalanceDue,
+          // a cancelled invoice must stay cancelled
+          status: invoice.status === 'cancelled' ? 'cancelled' : newAmountPaid <= 0 ? 'sent' : 'partial',
+        },
+      });
+    }
+
+    // Original posting side, then flip it
+    // customer ledger: RECEIVED = credit, PAID = debit; supplier ledger: PAID = debit, RECEIVED = credit
+    // so in both ledgers the original line was a credit exactly when the money came IN
+    const wasCredit = payment.payment_type === 'RECEIVED';
+    const narration = payment.advance_payment
+      ? `Advance payment reversal${reason ? ` - ${reason}` : ''}`
+      : `Payment reversal for ${payment.invoice?.invoice_number}${reason ? ` - ${reason}` : ''}`;
+    const entry = {
+      businessId, fyId: activeFy.id, entryType: 'adjustment', referenceId: payment.id,
+      referenceType: 'payment_reversal', narration, entryDate: todayDate(),
+      ...(wasCredit ? { debit: payment.amount } : { credit: payment.amount }),
+    };
+    if (payment.party_type === 'SUPPLIER') await postSupplierEntry(tx, { ...entry, supplierId: payment.supplier_id });
+    else await postCustomerEntry(tx, { ...entry, customerId: payment.customer_id });
+
+    console.info(`[audit] payment ${payment.id} reversed by user ${req.user.userId}${reason ? `: ${reason}` : ''}`);
+  });
+
+  return res.json({ message: 'Payment reversed successfully' });
 });
 
 module.exports = router;

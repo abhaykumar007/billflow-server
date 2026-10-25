@@ -1,119 +1,94 @@
 const express = require('express');
 const router = express.Router();
 const prisma = require('../utils/prisma');
-const { authenticateToken } = require('../middleware/auth');
+const { authenticateToken, requireRole, MANAGERS } = require('../middleware/auth');
+const { lockRow } = require('../utils/lock');
 
 router.use(authenticateToken);
 
-// Helper: build label and date range from a year like 2025 (meaning FY 2025-26)
+// Helper: build label and date range from a year like 2025 (meaning FY 2025-26).
+// Explicit UTC so the result does not depend on the server's timezone.
 function buildFYData(startYear) {
-  const start = new Date(startYear, 3, 1);   // April 1
-  const end   = new Date(startYear + 1, 2, 31, 23, 59, 59, 999); // March 31
+  const start = new Date(Date.UTC(startYear, 3, 1));                          // April 1
+  const end   = new Date(Date.UTC(startYear + 1, 2, 31, 23, 59, 59, 999));    // March 31
   const shortEnd = String(startYear + 1).slice(2);
   const label = `FY ${startYear}-${shortEnd}`;
   return { label, start_date: start, end_date: end };
 }
 
 /**
- * Shared carry-forward helper.
- * Copies the last ledger balance for every customer and supplier from any prior FY
- * into newFyId as an opening entry dated at newFy.start_date.
- * Uses deterministic findFirst-per-entity instead of the fragile distinct+orderBy pattern.
+ * Carry-forward: closing balance of prevFy -> opening entry in curFy.
+ *
+ * The closing balance is the SUM of everything posted in prevFy (which already
+ * includes prevFy's own carry-forward), so balances chain correctly across any
+ * number of years and do not depend on entry ordering. Idempotent per party:
+ * a customer/supplier that already has a carry-forward entry in curFy is skipped.
  */
-async function runCarryForward(tx, businessId, oldFy, newFyId, newFy) {
-  const entryDate = new Date(newFy.start_date);
+async function carryForwardInto(tx, businessId, prevFy, curFy) {
+  const entryDate = new Date(curFy.start_date);
 
-  // ── Customer carry-forward ───────────────────────────────────────────────
-  // Step 1: get distinct customer IDs that have entries outside the new FY
-  const customerIdRows = await tx.ledgerEntry.findMany({
-    where: { business_id: businessId, financial_year_id: { not: newFyId } },
-    select: { customer_id: true },
-    distinct: ['customer_id'],
-  });
+  const [custTotals, suppTotals, custDone, suppDone] = await Promise.all([
+    tx.ledgerEntry.groupBy({
+      by: ['customer_id'],
+      where: { business_id: businessId, financial_year_id: prevFy.id },
+      _sum: { debit: true, credit: true },
+    }),
+    tx.supplierLedgerEntry.groupBy({
+      by: ['supplier_id'],
+      where: { business_id: businessId, financial_year_id: prevFy.id },
+      _sum: { debit: true, credit: true },
+    }),
+    tx.ledgerEntry.findMany({
+      where: { business_id: businessId, financial_year_id: curFy.id, entry_type: 'carry_forward' },
+      select: { customer_id: true },
+    }),
+    tx.supplierLedgerEntry.findMany({
+      where: { business_id: businessId, financial_year_id: curFy.id, entry_type: 'carry_forward' },
+      select: { supplier_id: true },
+    }),
+  ]);
+  const custSkip = new Set(custDone.map((r) => r.customer_id));
+  const suppSkip = new Set(suppDone.map((r) => r.supplier_id));
 
-  // Step 2: for each customer fetch their most recent entry with a stable sort
-  const customerLastEntries = await Promise.all(
-    customerIdRows.map(({ customer_id }) =>
-      tx.ledgerEntry.findFirst({
-        where: {
-          business_id: businessId,
-          customer_id,
-          financial_year_id: { not: newFyId },
-        },
-        orderBy: [{ created_at: 'desc' }, { id: 'desc' }],
-      })
-    )
-  );
-
-  // ── Supplier carry-forward ───────────────────────────────────────────────
-  const supplierIdRows = await tx.supplierLedgerEntry.findMany({
-    where: { business_id: businessId, financial_year_id: { not: newFyId } },
-    select: { supplier_id: true },
-    distinct: ['supplier_id'],
-  });
-
-  const supplierLastEntries = await Promise.all(
-    supplierIdRows.map(({ supplier_id }) =>
-      tx.supplierLedgerEntry.findFirst({
-        where: {
-          business_id: businessId,
-          supplier_id,
-          financial_year_id: { not: newFyId },
-        },
-        orderBy: [{ created_at: 'desc' }, { id: 'desc' }],
-      })
-    )
-  );
-
-  // Build DB operations for all non-zero balances
-  const ops = [];
-
-  for (const entry of customerLastEntries) {
-    if (!entry || entry.balance === 0) continue;
-    const bal = entry.balance;
-    ops.push(
-      tx.ledgerEntry.create({
-        data: {
-          business_id: businessId,
-          financial_year_id: newFyId,
-          customer_id: entry.customer_id,
-          entry_type: 'carry_forward',
-          reference_type: 'carry_forward',
-          reference_id: oldFy.id,
-          debit: bal > 0 ? bal : 0,
-          credit: bal < 0 ? -bal : 0,
-          balance: bal,
-          narration: `Balance carried forward from ${oldFy.label}`,
-          entry_date: entryDate,
-        },
-      })
-    );
+  const custRows = [];
+  for (const t of custTotals) {
+    if (custSkip.has(t.customer_id)) continue;
+    const bal = (t._sum.debit || 0) - (t._sum.credit || 0); // + = customer owes us
+    if (bal === 0) continue;
+    custRows.push({
+      business_id: businessId, financial_year_id: curFy.id, customer_id: t.customer_id,
+      entry_type: 'carry_forward', reference_type: 'carry_forward', reference_id: prevFy.id,
+      debit: bal > 0 ? bal : 0, credit: bal < 0 ? -bal : 0, balance: bal,
+      narration: `Balance carried forward from ${prevFy.label}`, entry_date: entryDate,
+    });
   }
 
-  for (const entry of supplierLastEntries) {
-    if (!entry || entry.balance === 0) continue;
-    const bal = entry.balance;
-    ops.push(
-      tx.supplierLedgerEntry.create({
-        data: {
-          business_id: businessId,
-          financial_year_id: newFyId,
-          supplier_id: entry.supplier_id,
-          entry_type: 'carry_forward',
-          reference_type: 'carry_forward',
-          reference_id: oldFy.id,
-          debit: bal < 0 ? -bal : 0,
-          credit: bal > 0 ? bal : 0,
-          balance: bal,
-          narration: `Balance carried forward from ${oldFy.label}`,
-          entry_date: entryDate,
-        },
-      })
-    );
+  const suppRows = [];
+  for (const t of suppTotals) {
+    if (suppSkip.has(t.supplier_id)) continue;
+    const bal = (t._sum.credit || 0) - (t._sum.debit || 0); // + = we owe supplier
+    if (bal === 0) continue;
+    suppRows.push({
+      business_id: businessId, financial_year_id: curFy.id, supplier_id: t.supplier_id,
+      entry_type: 'carry_forward', reference_type: 'carry_forward', reference_id: prevFy.id,
+      debit: bal < 0 ? -bal : 0, credit: bal > 0 ? bal : 0, balance: bal,
+      narration: `Balance carried forward from ${prevFy.label}`, entry_date: entryDate,
+    });
   }
 
-  if (ops.length > 0) {
-    await Promise.all(ops);
+  if (custRows.length) await tx.ledgerEntry.createMany({ data: custRows });
+  if (suppRows.length) await tx.supplierLedgerEntry.createMany({ data: suppRows });
+}
+
+// Carries balances through every year between the first one and `targetFy`
+// (a year skipped over still gets its chain link, so nothing is lost).
+async function ensureCarryForwardChain(tx, businessId, targetFy) {
+  const years = await tx.financialYear.findMany({
+    where: { business_id: businessId, start_date: { lte: targetFy.start_date } },
+    orderBy: { start_date: 'asc' },
+  });
+  for (let i = 1; i < years.length; i++) {
+    await carryForwardInto(tx, businessId, years[i - 1], years[i]);
   }
 }
 
@@ -133,14 +108,13 @@ router.get('/', async (req, res) => {
 
 // POST /api/financial-years — create a financial year
 // Body: { start_year: 2025 }  → creates FY 2025-26
-router.post('/', async (req, res) => {
+router.post('/', requireRole(...MANAGERS), async (req, res) => {
   const { start_year } = req.body;
 
-  if (!start_year || isNaN(start_year)) {
-    return res.status(400).json({ error: 'start_year is required (e.g. 2025 for FY 2025-26)' });
-  }
-
   const yr = parseInt(start_year, 10);
+  if (!Number.isInteger(yr) || yr < 2000 || yr > 2100) {
+    return res.status(400).json({ error: 'start_year must be a year between 2000 and 2100 (e.g. 2025 for FY 2025-26)' });
+  }
   const { label, start_date, end_date } = buildFYData(yr);
 
   try {
@@ -250,47 +224,41 @@ router.get('/close/checklist', async (req, res) => {
   }
 });
 
-// PUT /api/financial-years/:id/activate — switch active financial year + carry-forward
-router.put('/:id/activate', async (req, res) => {
+// PUT /api/financial-years/:id/activate - make this the business's CURRENT year (new entries default to it).
+// Only moves forward: to just LOOK at an older year, send the X-Financial-Year-Id header instead.
+router.put('/:id/activate', requireRole(...MANAGERS), async (req, res) => {
   const { id } = req.params;
   const businessId = req.user.businessId;
 
   try {
-    const newFy = await prisma.financialYear.findFirst({
-      where: { id, business_id: businessId },
-    });
+    const newFy = await prisma.financialYear.findFirst({ where: { id, business_id: businessId } });
     if (!newFy) return res.status(404).json({ error: 'Financial year not found' });
-
-    // Find the currently active FY before switching
-    const oldFy = await prisma.financialYear.findFirst({
-      where: { business_id: businessId, is_active: true },
-    });
-
-    // Deactivate all, then activate the selected one
-    await prisma.$transaction([
-      prisma.financialYear.updateMany({
-        where: { business_id: businessId },
-        data: { is_active: false },
-      }),
-      prisma.financialYear.update({
-        where: { id },
-        data: { is_active: true },
-      }),
-    ]);
-
-    // Carry-forward: only if switching to a different FY
-    if (oldFy && oldFy.id !== id) {
-      const alreadyDone = await prisma.ledgerEntry.findFirst({
-        where: { business_id: businessId, financial_year_id: id, reference_type: 'carry_forward' },
-      });
-      if (!alreadyDone) {
-        await prisma.$transaction((tx) => runCarryForward(tx, businessId, oldFy, id, newFy));
-      }
+    if (newFy.is_closed) {
+      return res.status(400).json({ error: 'A closed financial year cannot be made current.', code: 'FY_CLOSED' });
     }
 
+    const result = await prisma.$transaction(async (tx) => {
+      await lockRow(tx, 'financialYear', id);
+      const oldFy = await tx.financialYear.findFirst({ where: { business_id: businessId, is_active: true } });
+      if (oldFy && oldFy.id !== id && oldFy.start_date > newFy.start_date) {
+        const err = new Error('Cannot make an earlier year current');
+        err.status = 400;
+        throw err;
+      }
+
+      // one transaction: switch + carry-forward either both happen or neither does
+      await tx.financialYear.updateMany({ where: { business_id: businessId }, data: { is_active: false } });
+      await tx.financialYear.update({ where: { id }, data: { is_active: true } });
+      await ensureCarryForwardChain(tx, businessId, newFy);
+      return { switched: !!oldFy && oldFy.id !== id };
+    });
+
     const updated = await prisma.financialYear.findUnique({ where: { id } });
-    return res.json({ ...updated, carry_forward_done: !!(oldFy && oldFy.id !== id) });
+    return res.json({ ...updated, carry_forward_done: result.switched });
   } catch (err) {
+    if (err.status === 400) {
+      return res.status(400).json({ error: 'To view an earlier year, select it as a view; it cannot be made the current year.', code: 'FY_BACKWARD' });
+    }
     console.error('FY activate error:', err);
     return res.status(500).json({ error: 'Failed to activate financial year' });
   }
@@ -298,7 +266,7 @@ router.put('/:id/activate', async (req, res) => {
 
 // POST /api/financial-years/:id/close — close the active financial year
 // Body: { force: true } to close despite pending items
-router.post('/:id/close', async (req, res) => {
+router.post('/:id/close', requireRole(...MANAGERS), async (req, res) => {
   const { id } = req.params;
   const businessId = req.user.businessId;
   const force = req.body?.force === true;
@@ -354,7 +322,7 @@ router.post('/:id/close', async (req, res) => {
     }
 
     // Determine the next FY label and dates
-    const currentStartYear = fy.start_date.getFullYear();
+    const currentStartYear = fy.start_date.getUTCFullYear();
     const nextStartYear = currentStartYear + 1;
     const { label: newLabel, start_date: newStart, end_date: newEnd } = buildFYData(nextStartYear);
 
@@ -393,13 +361,8 @@ router.post('/:id/close', async (req, res) => {
         });
       }
 
-      // 3. Run carry-forward (idempotent check inside)
-      const alreadyDone = await tx.ledgerEntry.findFirst({
-        where: { business_id: businessId, financial_year_id: nextFy.id, reference_type: 'carry_forward' },
-      });
-      if (!alreadyDone) {
-        await runCarryForward(tx, businessId, fy, nextFy.id, nextFy);
-      }
+      // 3. Carry balances forward (chained + idempotent per party)
+      await ensureCarryForwardChain(tx, businessId, nextFy);
 
       // 4. Stock snapshot — capture current stock into new FY's opening_stock_snapshot (S1-G)
       const products = await tx.product.findMany({
@@ -424,23 +387,23 @@ router.post('/:id/close', async (req, res) => {
   }
 });
 
-// PUT /api/financial-years/:id/lock — toggle lock/unlock
-router.put('/:id/lock', async (req, res) => {
+// PUT /api/financial-years/:id/lock - lock or unlock. Body { locked: true|false } (toggles if omitted).
+// A CLOSED year is permanently locked.
+router.put('/:id/lock', requireRole(...MANAGERS), async (req, res) => {
   const { id } = req.params;
   const businessId = req.user.businessId;
 
   try {
-    const fy = await prisma.financialYear.findFirst({
-      where: { id, business_id: businessId },
-    });
+    const fy = await prisma.financialYear.findFirst({ where: { id, business_id: businessId } });
     if (!fy) return res.status(404).json({ error: 'Financial year not found' });
 
-    // Toggle: if locked → unlock, if unlocked → lock
-    const updated = await prisma.financialYear.update({
-      where: { id },
-      data: { is_locked: !fy.is_locked },
-    });
+    const target = typeof req.body?.locked === 'boolean' ? req.body.locked : !fy.is_locked;
+    if (fy.is_closed && !target) {
+      return res.status(400).json({ error: 'A closed financial year cannot be unlocked.', code: 'FY_CLOSED' });
+    }
 
+    const updated = await prisma.financialYear.update({ where: { id }, data: { is_locked: target } });
+    console.info(`[audit] FY ${fy.label} ${target ? 'locked' : 'unlocked'} by user ${req.user.userId}`);
     return res.json(updated);
   } catch (err) {
     console.error('FY lock toggle error:', err);
