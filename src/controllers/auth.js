@@ -300,7 +300,7 @@ async function forgotPassword(req, res) {
       },
     });
 
-    const base = process.env.RESET_URL_BASE || `${process.env.CLIENT_URL || 'http://localhost:5173'}/reset-password`;
+    const base = process.env.RESET_URL_BASE || `${(process.env.CLIENT_URL || 'http://localhost:5173').split(',')[0].trim()}/reset-password`;
     await sendMail({
       to: user.email,
       subject: 'Reset your BillFlow password',
