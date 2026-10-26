@@ -102,6 +102,15 @@ if (require.main === module) {
     process.env.JWT_SECRET = require('crypto').createHash('sha256').update('billflow-jwt-v1:' + process.env.DATABASE_URL).digest('hex');
     console.warn('JWT_SECRET is not set: using a secret derived from DATABASE_URL. Set JWT_SECRET in the environment.');
   }
+  // A stale generated Prisma client (schema changed, client not regenerated) answers every request with a 500.
+  // Refuse to start instead, so a broken build never replaces a working deploy.
+  const prismaClient = require('./utils/prisma');
+  for (const model of ['refreshSession', 'passwordResetToken', 'subscriptionPayment']) {
+    if (!prismaClient[model]) {
+      console.error('Prisma client is out of date (missing ' + model + '). Run: prisma generate');
+      process.exit(1);
+    }
+  }
   const required = ['DATABASE_URL', 'JWT_SECRET'];
   const missing = required.filter((k) => !process.env[k]);
   if (missing.length) {
