@@ -3,6 +3,11 @@ const router = express.Router();
 const prisma = require('../utils/prisma');
 const { authenticateToken } = require('../middleware/auth');
 const { attachFinancialYear } = require('../middleware/financialYear');
+const { requireRole, MANAGERS } = require('../middleware/auth');
+const { HttpError } = require('../utils/httpError');
+const { parseParty, rupeesToPaise, pageParams } = require('../utils/validate');
+const { parseDayStart, parseDayEnd, todayDate } = require('../utils/time');
+const { postCustomerEntry, getActiveFY } = require('../utils/ledger');
 
 router.use(authenticateToken);
 
@@ -10,8 +15,8 @@ router.use(authenticateToken);
 router.get('/', async (req, res) => {
   try {
     const businessId = req.user.businessId;
-    const { search = '', page = 1, limit = 50 } = req.query;
-    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const { search = '' } = req.query;
+    const { page, limit, skip } = pageParams(req.query);
 
     const where = {
       business_id: businessId,
@@ -32,7 +37,7 @@ router.get('/', async (req, res) => {
         where,
         orderBy: { name: 'asc' },
         skip,
-        take: parseInt(limit),
+        take: limit,
         select: {
           id: true,
           name: true,
@@ -57,6 +62,7 @@ router.get('/', async (req, res) => {
       where: {
         business_id: businessId,
         customer_id: { in: customerIds },
+        voucher_type: 'SALE', // returns reduce what is owed (ledger); they are not receivables
         status: { in: ['sent', 'partial'] },
         is_deleted: false,
       },
@@ -66,12 +72,26 @@ router.get('/', async (req, res) => {
       outstandingData.map((o) => [o.customer_id, o._sum.balance_due || 0])
     );
 
+    // Ledger balance (opening balance + invoices - payments), in the current financial year chain
+    const activeFy = await getActiveFY(prisma, businessId);
+    const ledgerTotals = activeFy
+      ? await prisma.ledgerEntry.groupBy({
+          by: ['customer_id'],
+          where: { business_id: businessId, financial_year_id: activeFy.id, customer_id: { in: customerIds } },
+          _sum: { debit: true, credit: true },
+        })
+      : [];
+    const ledgerMap = Object.fromEntries(
+      ledgerTotals.map((t) => [t.customer_id, (t._sum.debit || 0) - (t._sum.credit || 0)])
+    );
+
     const enriched = customers.map((c) => ({
       ...c,
       outstanding: outstandingMap[c.id] || 0,
+      ledger_balance: ledgerMap[c.id] || 0,
     }));
 
-    return res.json({ customers: enriched, total, page: parseInt(page), limit: parseInt(limit) });
+    return res.json({ customers: enriched, total, page, limit });
   } catch (err) {
     console.error('List customers error:', err);
     return res.status(500).json({ error: 'Failed to fetch customers' });
@@ -93,7 +113,9 @@ router.get('/:id', async (req, res) => {
           customer_id: customer.id,
           business_id: businessId,
           is_deleted: false,
-          status: { not: 'cancelled' },
+          // real sales only: estimates and drafts are not billed amounts
+          voucher_type: 'SALE',
+          status: { notIn: ['cancelled', 'draft'] },
         },
         _sum: { total_amount: true, amount_paid: true, balance_due: true },
         _count: { id: true },
@@ -119,9 +141,18 @@ router.get('/:id', async (req, res) => {
       }),
     ]);
 
+    const activeFy = await getActiveFY(prisma, businessId);
+    const ledgerAgg = activeFy
+      ? await prisma.ledgerEntry.aggregate({
+          where: { business_id: businessId, customer_id: customer.id, financial_year_id: activeFy.id },
+          _sum: { debit: true, credit: true },
+        })
+      : null;
+
     return res.json({
       ...customer,
       summary: {
+        ledgerBalance: ledgerAgg ? (ledgerAgg._sum.debit || 0) - (ledgerAgg._sum.credit || 0) : 0,
         totalBilled: invoiceSummary._sum.total_amount || 0,
         totalPaid: totalPaid._sum.amount || 0,
         outstanding: invoiceSummary._sum.balance_due || 0,
@@ -135,12 +166,12 @@ router.get('/:id', async (req, res) => {
   }
 });
 
-// GET /api/customers/:id/ledger — transaction history (FY-scoped)
+// GET /api/customers/:id/ledger — transaction history (FY-scoped), running balance recomputed
 router.get('/:id/ledger', attachFinancialYear, async (req, res) => {
   try {
     const businessId = req.user.businessId;
-    const { from, to, page = 1, limit = 50 } = req.query;
-    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const { from, to } = req.query;
+    const { page, limit, skip } = pageParams(req.query);
 
     const customer = await prisma.customer.findFirst({
       where: { id: req.params.id, business_id: businessId, is_deleted: false },
@@ -148,31 +179,38 @@ router.get('/:id/ledger', attachFinancialYear, async (req, res) => {
     });
     if (!customer) return res.status(404).json({ error: 'Customer not found' });
 
-    const where = {
+    const base = {
       customer_id: req.params.id,
       business_id: businessId,
       ...(req.financialYear ? { financial_year_id: req.financialYear.id } : {}),
+    };
+    const where = {
+      ...base,
       ...(from || to
-        ? {
-            entry_date: {
-              ...(from ? { gte: new Date(from) } : {}),
-              ...(to ? { lte: new Date(to) } : {}),
-            },
-          }
+        ? { entry_date: { ...(from ? { gte: parseDayStart(from) } : {}), ...(to ? { lte: parseDayEnd(to) } : {}) } }
         : {}),
     };
 
-    const [entries, total] = await Promise.all([
-      prisma.ledgerEntry.findMany({
-        where,
-        orderBy: { entry_date: 'asc' },
-        skip,
-        take: parseInt(limit),
-      }),
+    let opening = 0;
+    if (from) {
+      const before = await prisma.ledgerEntry.aggregate({
+        where: { ...base, entry_date: { lt: parseDayStart(from) } },
+        _sum: { debit: true, credit: true },
+      });
+      opening = (before._sum.debit || 0) - (before._sum.credit || 0);
+    }
+
+    const [all, total] = await Promise.all([
+      prisma.ledgerEntry.findMany({ where, orderBy: [{ entry_date: 'asc' }, { created_at: 'asc' }, { id: 'asc' }] }),
       prisma.ledgerEntry.count({ where }),
     ]);
+    let running = opening;
+    const withBalance = all.map((e) => {
+      running += e.debit - e.credit;
+      return { ...e, balance: running };
+    });
 
-    return res.json({ entries, total, page: parseInt(page), limit: parseInt(limit) });
+    return res.json({ entries: withBalance.slice(skip, skip + limit), total, page, limit });
   } catch (err) {
     console.error('Ledger error:', err);
     return res.status(500).json({ error: 'Failed to fetch ledger' });
@@ -183,8 +221,7 @@ router.get('/:id/ledger', attachFinancialYear, async (req, res) => {
 router.get('/:id/invoices', async (req, res) => {
   try {
     const businessId = req.user.businessId;
-    const { page = 1, limit = 20 } = req.query;
-    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const { page, limit, skip } = pageParams(req.query, 20);
 
     const customer = await prisma.customer.findFirst({
       where: { id: req.params.id, business_id: businessId, is_deleted: false },
@@ -197,7 +234,7 @@ router.get('/:id/invoices', async (req, res) => {
         where: { customer_id: req.params.id, business_id: businessId, is_deleted: false },
         orderBy: { invoice_date: 'desc' },
         skip,
-        take: parseInt(limit),
+        take: limit,
         select: {
           id: true,
           invoice_number: true,
@@ -214,7 +251,7 @@ router.get('/:id/invoices', async (req, res) => {
       }),
     ]);
 
-    return res.json({ invoices, total, page: parseInt(page), limit: parseInt(limit) });
+    return res.json({ invoices, total, page, limit });
   } catch (err) {
     console.error('Customer invoices error:', err);
     return res.status(500).json({ error: 'Failed to fetch invoices' });
@@ -223,121 +260,69 @@ router.get('/:id/invoices', async (req, res) => {
 
 // POST /api/customers — create
 router.post('/', async (req, res) => {
-  try {
-    const businessId = req.user.businessId;
-    const {
-      name,
-      phone,
-      email,
-      address,
-      city,
-      state,
-      pincode,
-      gstin,
-      opening_balance = 0,
-      balance_type = 'DR',
-      credit_limit = 0,
-      credit_limit_type = 'soft',
-      credit_days = 0,
-    } = req.body;
+  const businessId = req.user.businessId;
+  const fields = parseParty(req.body);
+  const balanceType = req.body.balance_type === 'CR' ? 'CR' : 'DR';
+  if (req.body.balance_type && !['DR', 'CR'].includes(req.body.balance_type)) {
+    throw new HttpError(400, "balance_type must be 'DR' or 'CR'", 'VALIDATION');
+  }
+  const openingPaise = rupeesToPaise(req.body.opening_balance, 'opening balance');
+  const creditLimit = rupeesToPaise(req.body.credit_limit, 'credit limit');
+  const creditLimitType = ['soft', 'hard'].includes(req.body.credit_limit_type) ? req.body.credit_limit_type : 'soft';
+  const creditDays = Math.min(Math.max(parseInt(req.body.credit_days) || 0, 0), 3650);
 
-    if (!name) return res.status(400).json({ error: 'Name is required' });
-
-    const customer = await prisma.customer.create({
+  const customer = await prisma.$transaction(async (tx) => {
+    const created = await tx.customer.create({
       data: {
         business_id: businessId,
-        name: name.trim(),
-        phone: phone?.trim() || null,
-        email: email?.trim() || null,
-        address: address?.trim() || null,
-        city: city?.trim() || null,
-        state: state?.trim() || null,
-        pincode: pincode?.trim() || null,
-        gstin: gstin?.trim() || null,
-        opening_balance: Math.round(opening_balance * 100), // rupees → paise
-        balance_type,
-        credit_limit: Math.round((parseFloat(credit_limit) || 0) * 100), // rupees → paise
-        credit_limit_type: ['soft', 'hard'].includes(credit_limit_type) ? credit_limit_type : 'soft',
-        credit_days: parseInt(credit_days) || 0,
+        ...fields,
+        opening_balance: openingPaise,
+        balance_type: balanceType,
+        credit_limit: creditLimit,
+        credit_limit_type: creditLimitType,
+        credit_days: creditDays,
       },
     });
 
-    // Create opening balance ledger entry if non-zero
-    const obAmount = parseFloat(opening_balance) || 0;
-    if (obAmount !== 0) {
-      await prisma.ledgerEntry.create({
-        data: {
-          business_id: businessId,
-          customer_id: customer.id,
-          entry_type: 'adjustment',
-          reference_id: customer.id,
-          reference_type: 'opening_balance',
-          debit: balance_type === 'DR' ? Math.round(obAmount * 100) : 0,
-          credit: balance_type === 'CR' ? Math.round(obAmount * 100) : 0,
-          balance: balance_type === 'CR' ? -Math.round(obAmount * 100) : Math.round(obAmount * 100),
-          narration: 'Opening balance',
-          entry_date: new Date(),
-        },
+    // The opening balance is a ledger entry INSIDE the active financial year (never year-less),
+    // so year-filtered ledgers, balances and carry-forward all see it.
+    if (openingPaise > 0) {
+      const fy = await getActiveFY(tx, businessId);
+      await postCustomerEntry(tx, {
+        businessId, customerId: created.id, fyId: fy?.id || null,
+        debit: balanceType === 'DR' ? openingPaise : 0,
+        credit: balanceType === 'CR' ? openingPaise : 0,
+        entryType: 'adjustment', referenceId: created.id, referenceType: 'opening_balance',
+        narration: 'Opening balance', entryDate: fy ? (todayDate() < fy.start_date ? fy.start_date : todayDate()) : todayDate(),
       });
     }
+    return created;
+  });
 
-    return res.status(201).json(customer);
-  } catch (err) {
-    console.error('Create customer error:', err);
-    const msg = process.env.NODE_ENV === 'development' ? err.message : 'Failed to create customer';
-    return res.status(500).json({ error: msg });
-  }
+  return res.status(201).json(customer);
 });
 
 // PUT /api/customers/:id — update
 router.put('/:id', async (req, res) => {
-  try {
-    const businessId = req.user.businessId;
-    const existing = await prisma.customer.findFirst({
-      where: { id: req.params.id, business_id: businessId, is_deleted: false },
-    });
-    if (!existing) return res.status(404).json({ error: 'Customer not found' });
+  const businessId = req.user.businessId;
+  const existing = await prisma.customer.findFirst({
+    where: { id: req.params.id, business_id: businessId, is_deleted: false },
+  });
+  if (!existing) return res.status(404).json({ error: 'Customer not found' });
 
-    const {
-      name,
-      phone,
-      email,
-      address,
-      city,
-      state,
-      pincode,
-      gstin,
-      credit_limit,
-      credit_limit_type,
-      credit_days,
-    } = req.body;
+  const fields = parseParty(req.body, { partial: true });
+  const { credit_limit, credit_limit_type, credit_days } = req.body;
 
-    if (name !== undefined && !name.trim()) {
-      return res.status(400).json({ error: 'Name cannot be empty' });
-    }
-
-    const updated = await prisma.customer.update({
-      where: { id: req.params.id },
-      data: {
-        ...(name !== undefined && { name: name.trim() }),
-        ...(phone !== undefined && { phone: phone.trim() || null }),
-        ...(email !== undefined && { email: email.trim() || null }),
-        ...(address !== undefined && { address: address.trim() || null }),
-        ...(city !== undefined && { city: city.trim() || null }),
-        ...(state !== undefined && { state: state.trim() || null }),
-        ...(pincode !== undefined && { pincode: pincode.trim() || null }),
-        ...(gstin !== undefined && { gstin: gstin.trim() || null }),
-        ...(credit_limit !== undefined && { credit_limit: Math.round((parseFloat(credit_limit) || 0) * 100) }),
-        ...(credit_limit_type !== undefined && { credit_limit_type: ['soft', 'hard'].includes(credit_limit_type) ? credit_limit_type : 'soft' }),
-        ...(credit_days !== undefined && { credit_days: parseInt(credit_days) || 0 }),
-      },
-    });
-
-    return res.json(updated);
-  } catch (err) {
-    console.error('Update customer error:', err);
-    return res.status(500).json({ error: 'Failed to update customer' });
-  }
+  const updated = await prisma.customer.update({
+    where: { id: req.params.id },
+    data: {
+      ...fields,
+      ...(credit_limit !== undefined && { credit_limit: rupeesToPaise(credit_limit, 'credit limit') }),
+      ...(credit_limit_type !== undefined && { credit_limit_type: ['soft', 'hard'].includes(credit_limit_type) ? credit_limit_type : 'soft' }),
+      ...(credit_days !== undefined && { credit_days: Math.min(Math.max(parseInt(credit_days) || 0, 0), 3650) }),
+    },
+  });
+  return res.json(updated);
 });
 
 // GET /api/customers/:id/credit-status
@@ -380,7 +365,7 @@ router.get('/:id/credit-status', async (req, res) => {
 });
 
 // DELETE /api/customers/:id — soft delete
-router.delete('/:id', async (req, res) => {
+router.delete('/:id', requireRole(...MANAGERS), async (req, res) => {
   try {
     const businessId = req.user.businessId;
     const customer = await prisma.customer.findFirst({

@@ -1,7 +1,23 @@
 const express = require('express');
 const router = express.Router();
 const prisma = require('../utils/prisma');
-const { authenticateToken } = require('../middleware/auth');
+const { authenticateToken, requireRole, MANAGERS } = require('../middleware/auth');
+const { HttpError } = require('../utils/httpError');
+const { rupeesToPaise, pageParams } = require('../utils/validate');
+const { lockRow } = require('../utils/lock');
+
+const num = (v, field, { min = 0, max = 1e9 } = {}) => {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < min || n > max) throw new HttpError(400, `Invalid ${field}`, 'VALIDATION');
+  return n;
+};
+
+async function assertCategory(client, businessId, categoryId) {
+  if (!categoryId) return null;
+  const c = await client.productCategory.findFirst({ where: { id: categoryId, business_id: businessId, is_deleted: false }, select: { id: true } });
+  if (!c) throw new HttpError(404, 'Category not found', 'NOT_FOUND');
+  return c.id;
+}
 
 router.use(authenticateToken);
 
@@ -29,8 +45,8 @@ router.get('/low-stock', async (req, res) => {
 router.get('/', async (req, res) => {
   try {
     const businessId = req.user.businessId;
-    const { search = '', page = 1, limit = 100, active } = req.query;
-    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const { search = '', active } = req.query;
+    const { page, limit, skip } = pageParams(req.query, 100, 500);
 
     const { category_id } = req.query;
 
@@ -59,13 +75,13 @@ router.get('/', async (req, res) => {
         where,
         orderBy: { name: 'asc' },
         skip,
-        take: parseInt(limit),
+        take: limit,
         include: { category: { select: { id: true, name: true, color: true } } },
       }),
       prisma.product.count({ where }),
     ]);
 
-    return res.json({ products, total, page: parseInt(page), limit: parseInt(limit) });
+    return res.json({ products, total, page, limit });
   } catch (err) {
     console.error('List products error:', err);
     return res.status(500).json({ error: 'Failed to fetch products' });
@@ -116,23 +132,24 @@ router.post('/', async (req, res) => {
     const product = await prisma.product.create({
       data: {
         business_id: businessId,
-        name: name.trim(),
+        name: name.trim().slice(0, 150),
         description: description?.trim() || null,
-        unit,
-        sale_price: Math.round((sale_price || 0) * 100),       // rupees → paise
-        purchase_price: Math.round((purchase_price || 0) * 100),
-        tax_rate: parseFloat(tax_rate) || 0,
+        unit: String(unit).slice(0, 20),
+        sale_price: rupeesToPaise(sale_price, 'sale price'),         // rupees → paise
+        purchase_price: rupeesToPaise(purchase_price, 'purchase price'),
+        tax_rate: num(tax_rate, 'GST %', { max: 100 }),
         hsn_code: hsn_code?.trim() || null,
         track_inventory: Boolean(track_inventory),
-        stock_quantity: track_inventory ? parseInt(stock_quantity) || 0 : 0,
-        low_stock_alert: parseInt(low_stock_alert) || 10,
-        category_id: category_id || null,
+        stock_quantity: track_inventory ? num(stock_quantity, 'stock quantity', { min: -1e9 }) : 0,
+        low_stock_alert: Math.max(parseInt(low_stock_alert) || 0, 0),
+        category_id: await assertCategory(prisma, businessId, category_id),
       },
       include: { category: { select: { id: true, name: true, color: true } } },
     });
 
     return res.status(201).json(product);
   } catch (err) {
+    if (err instanceof HttpError) return res.status(err.status).json({ error: err.message, code: err.code });
     console.error('Create product error:', err);
     return res.status(500).json({ error: 'Failed to create product' });
   }
@@ -173,24 +190,32 @@ router.put('/:id', async (req, res) => {
       if (duplicate) return res.status(409).json({ error: `A product named "${duplicate.name}" already exists` });
     }
 
-    const updated = await prisma.product.update({
-      where: { id: req.params.id },
-      data: {
-        ...(name !== undefined && { name: name.trim() }),
-        ...(description !== undefined && { description: description?.trim() || null }),
-        ...(unit !== undefined && { unit }),
-        ...(sale_price !== undefined && { sale_price: Math.round(sale_price * 100) }),
-        ...(purchase_price !== undefined && { purchase_price: Math.round(purchase_price * 100) }),
-        ...(tax_rate !== undefined && { tax_rate: parseFloat(tax_rate) }),
-        ...(hsn_code !== undefined && { hsn_code: hsn_code?.trim() || null }),
-        ...(track_inventory !== undefined && { track_inventory: Boolean(track_inventory) }),
-        ...(stock_quantity !== undefined && { stock_quantity: parseInt(stock_quantity) }),
-        ...(low_stock_alert !== undefined && { low_stock_alert: parseInt(low_stock_alert) }),
-        ...(is_active !== undefined && { is_active: Boolean(is_active) }),
-        ...('category_id' in req.body && { category_id: category_id || null }),
-      },
-      include: { category: { select: { id: true, name: true, color: true } } },
+    const categoryId = 'category_id' in req.body ? await assertCategory(prisma, businessId, category_id) : undefined;
+
+    const updated = await prisma.$transaction(async (tx) => {
+      await lockRow(tx, 'product', req.params.id); // serialise with invoices moving stock
+      return tx.product.update({
+        where: { id: req.params.id },
+        data: {
+          ...(name !== undefined && { name: name.trim().slice(0, 150) }),
+          ...(description !== undefined && { description: description?.trim() || null }),
+          ...(unit !== undefined && { unit: String(unit).slice(0, 20) }),
+          ...(sale_price !== undefined && { sale_price: rupeesToPaise(sale_price, 'sale price') }),
+          ...(purchase_price !== undefined && { purchase_price: rupeesToPaise(purchase_price, 'purchase price') }),
+          ...(tax_rate !== undefined && { tax_rate: num(tax_rate, 'GST %', { max: 100 }) }),
+          ...(hsn_code !== undefined && { hsn_code: hsn_code?.trim() || null }),
+          ...(track_inventory !== undefined && { track_inventory: Boolean(track_inventory) }),
+          ...(stock_quantity !== undefined && { stock_quantity: num(stock_quantity, 'stock quantity', { min: -1e9 }) }),
+          ...(low_stock_alert !== undefined && { low_stock_alert: Math.max(parseInt(low_stock_alert) || 0, 0) }),
+          ...(is_active !== undefined && { is_active: Boolean(is_active) }),
+          ...(categoryId !== undefined && { category_id: categoryId }),
+        },
+        include: { category: { select: { id: true, name: true, color: true } } },
+      });
     });
+    if (stock_quantity !== undefined && Number(stock_quantity) !== existing.stock_quantity) {
+      console.info(`[audit] stock of product ${existing.id} set ${existing.stock_quantity} -> ${stock_quantity} by user ${req.user.userId}`);
+    }
 
     return res.json(updated);
   } catch (err) {
@@ -200,7 +225,7 @@ router.put('/:id', async (req, res) => {
 });
 
 // DELETE /api/products/:id — soft delete
-router.delete('/:id', async (req, res) => {
+router.delete('/:id', requireRole(...MANAGERS), async (req, res) => {
   try {
     const businessId = req.user.businessId;
     const product = await prisma.product.findFirst({

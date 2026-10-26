@@ -2,7 +2,14 @@ const express = require('express');
 const router = express.Router();
 const bcrypt = require('bcryptjs');
 const prisma = require('../utils/prisma');
-const { authenticateToken } = require('../middleware/auth');
+const { authenticateToken, requireRole, MANAGERS } = require('../middleware/auth');
+const { getActivePlan, PLAN_LIMITS } = require('../middleware/planLimit');
+const { sha256 } = require('../utils/session');
+
+const GSTIN_RE = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/;
+const PAN_RE = /^[A-Z]{5}[0-9]{4}[A-Z]$/;
+// GST rule 46: invoice number max 16 chars (letters, digits, '-' and '/'). "<PFX>-2526-0001" => prefix <= 5
+const PREFIX_RE = /^[A-Z0-9]{1,5}$/;
 
 router.use(authenticateToken);
 
@@ -20,10 +27,15 @@ router.get('/business', async (req, res) => {
 });
 
 // PUT /api/settings/business
-router.put('/business', async (req, res) => {
+router.put('/business', requireRole('owner'), async (req, res) => {
   try {
-    const { name, address, city, state, pincode, gstin, pan, phone, email, logo_url } = req.body;
+    const { name, address, city, state, pincode, phone, email, logo_url } = req.body;
+    const gstin = req.body.gstin ? String(req.body.gstin).trim().toUpperCase() : null;
+    const pan = req.body.pan ? String(req.body.pan).trim().toUpperCase() : null;
     if (!name || !name.trim()) return res.status(400).json({ error: 'Business name is required' });
+    if (gstin && !GSTIN_RE.test(gstin)) return res.status(400).json({ error: 'Enter a valid 15-character GSTIN' });
+    if (pan && !PAN_RE.test(pan)) return res.status(400).json({ error: 'Enter a valid 10-character PAN' });
+    if (logo_url && !/^https:\/\//i.test(logo_url)) return res.status(400).json({ error: 'Logo URL must start with https://' });
     const business = await prisma.business.update({
       where: { id: req.user.businessId },
       data: { name: name.trim(), address, city, state, pincode, gstin, pan, phone, email, logo_url: logo_url || null },
@@ -66,7 +78,21 @@ router.get('/invoice', async (req, res) => {
 });
 
 // PUT /api/settings/invoice
-router.put('/invoice', async (req, res) => {
+// Highest sequence number already used for a counter family in a financial year
+async function maxSequenceUsed(financialYearId, voucherTypes) {
+  const rows = await prisma.invoice.findMany({
+    where: { financial_year_id: financialYearId, voucher_type: { in: voucherTypes } },
+    select: { invoice_number: true },
+  });
+  let max = 0;
+  for (const r of rows) {
+    const m = /(\d+)$/.exec(r.invoice_number);
+    if (m) max = Math.max(max, parseInt(m[1], 10));
+  }
+  return max;
+}
+
+router.put('/invoice', requireRole(...MANAGERS), async (req, res) => {
   try {
     const {
       invoice_prefix, invoice_next_number,
@@ -79,7 +105,7 @@ router.put('/invoice', async (req, res) => {
 
     if (invoice_prefix !== undefined) {
       const prefix = String(invoice_prefix).trim().toUpperCase();
-      if (!prefix) return res.status(400).json({ error: 'Sale invoice prefix cannot be empty' });
+      if (!PREFIX_RE.test(prefix)) return res.status(400).json({ error: 'Sale invoice prefix must be 1-5 letters or digits' });
       businessData.invoice_prefix = prefix;
     }
     if (invoice_next_number !== undefined) {
@@ -89,7 +115,7 @@ router.put('/invoice', async (req, res) => {
     }
     if (purchase_prefix !== undefined) {
       const prefix = String(purchase_prefix).trim().toUpperCase();
-      if (!prefix) return res.status(400).json({ error: 'Purchase invoice prefix cannot be empty' });
+      if (!PREFIX_RE.test(prefix)) return res.status(400).json({ error: 'Purchase invoice prefix must be 1-5 letters or digits' });
       businessData.purchase_prefix = prefix;
     }
     if (purchase_next_number !== undefined) {
@@ -115,6 +141,20 @@ router.put('/invoice', async (req, res) => {
       where: { business_id: req.user.businessId, is_active: true },
       select: { id: true, invoice_next_number: true, purchase_next_number: true },
     });
+
+    // The counter may never be moved to a number that is already in use (duplicate invoice numbers)
+    if (activeFY && fyData.invoice_next_number !== undefined) {
+      const used = await maxSequenceUsed(activeFY.id, ['SALE', 'SALE_RETURN']);
+      if (fyData.invoice_next_number <= used) {
+        return res.status(400).json({ error: `Next sale invoice number must be greater than ${used}, the highest already used this year` });
+      }
+    }
+    if (activeFY && fyData.purchase_next_number !== undefined) {
+      const used = await maxSequenceUsed(activeFY.id, ['PURCHASE', 'PURCHASE_RETURN']);
+      if (fyData.purchase_next_number <= used) {
+        return res.status(400).json({ error: `Next purchase number must be greater than ${used}, the highest already used this year` });
+      }
+    }
 
     const [business] = await Promise.all([
       prisma.business.update({
@@ -159,7 +199,7 @@ router.get('/tax', async (req, res) => {
 });
 
 // PUT /api/settings/tax
-router.put('/tax', async (req, res) => {
+router.put('/tax', requireRole(...MANAGERS), async (req, res) => {
   try {
     const { default_tax_rate, state } = req.body;
     const data = {};
@@ -195,42 +235,93 @@ router.get('/users', async (req, res) => {
   }
 });
 
-// POST /api/settings/users/invite — add a staff member (Starter/Pro only)
-router.post('/users/invite', async (req, res) => {
+// POST /api/settings/users/invite - add a team member (owner only; plan decides how many)
+router.post('/users/invite', requireRole('owner'), async (req, res) => {
   try {
-    const { name, email, password, role = 'staff' } = req.body;
+    const { name, password, role = 'staff' } = req.body;
+    const email = String(req.body.email || '').trim().toLowerCase();
     if (!name || !email || !password) {
       return res.status(400).json({ error: 'name, email, and password are required' });
     }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) return res.status(400).json({ error: 'Enter a valid email address' });
+    if (String(password).length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
     if (!['staff', 'accountant'].includes(role)) {
       return res.status(400).json({ error: 'role must be staff or accountant' });
     }
 
-    // Plan check — only Starter/Pro can invite team members
-    const { getActivePlan } = require('../middleware/planLimit');
     const plan = await getActivePlan(req.user.businessId);
-    if (plan === 'free') {
+    const userLimit = PLAN_LIMITS[plan].users;
+    const count = await prisma.user.count({ where: { business_id: req.user.businessId } });
+    if (count >= userLimit) {
       return res.status(403).json({
-        error: 'Multi-user access requires a Starter or Pro plan.',
+        error: plan === 'free'
+          ? 'Multi-user access requires a Starter or Pro plan.'
+          : `Your ${plan} plan allows ${userLimit} users.`,
         code: 'PLAN_LIMIT_REACHED',
       });
     }
 
-    const existing = await prisma.user.findUnique({ where: { email } });
+    const existing = await prisma.user.findFirst({ where: { email: { equals: email, mode: 'insensitive' } } });
     if (existing) return res.status(409).json({ error: 'Email already registered' });
 
-    const password_hash = await bcrypt.hash(password, 12);
+    const password_hash = await bcrypt.hash(String(password), 12);
     const user = await prisma.user.create({
-      data: {
-        name, email, password_hash, role,
-        business_id: req.user.businessId,
-      },
+      data: { name: String(name).trim(), email, password_hash, role, business_id: req.user.businessId },
       select: { id: true, name: true, email: true, role: true, created_at: true },
     });
     return res.status(201).json(user);
   } catch (err) {
     console.error('Invite user error:', err);
     return res.status(500).json({ error: 'Failed to invite user' });
+  }
+});
+
+// PUT /api/settings/users/:id/role - owner changes a team member's role
+router.put('/users/:id/role', requireRole('owner'), async (req, res) => {
+  try {
+    const { role } = req.body;
+    if (!['staff', 'accountant'].includes(role)) return res.status(400).json({ error: 'role must be staff or accountant' });
+    if (req.params.id === req.user.userId) return res.status(400).json({ error: 'You cannot change your own role' });
+    const target = await prisma.user.findFirst({ where: { id: req.params.id, business_id: req.user.businessId } });
+    if (!target) return res.status(404).json({ error: 'User not found' });
+    if (target.role === 'owner') return res.status(400).json({ error: 'The owner role cannot be changed' });
+    const user = await prisma.user.update({
+      where: { id: target.id },
+      data: { role },
+      select: { id: true, name: true, email: true, role: true },
+    });
+    return res.json(user);
+  } catch (err) {
+    console.error('Change role error:', err);
+    return res.status(500).json({ error: 'Failed to change role' });
+  }
+});
+
+// DELETE /api/settings/users/:id - owner removes a team member and signs them out everywhere
+router.delete('/users/:id', requireRole('owner'), async (req, res) => {
+  try {
+    if (req.params.id === req.user.userId) return res.status(400).json({ error: 'You cannot remove yourself' });
+    const target = await prisma.user.findFirst({ where: { id: req.params.id, business_id: req.user.businessId } });
+    if (!target) return res.status(404).json({ error: 'User not found' });
+    if (target.role === 'owner') return res.status(400).json({ error: 'The owner cannot be removed' });
+
+    const hasHistory = await prisma.invoice.count({ where: { created_by: target.id } });
+    if (hasHistory > 0) {
+      // keep the row (invoices reference it) but lock the account
+      await prisma.$transaction([
+        prisma.refreshSession.deleteMany({ where: { user_id: target.id } }),
+        prisma.user.update({
+          where: { id: target.id },
+          data: { password_hash: 'DISABLED', email: `removed+${target.id}@billflow.invalid` },
+        }),
+      ]);
+    } else {
+      await prisma.user.delete({ where: { id: target.id } });
+    }
+    return res.json({ message: 'User removed' });
+  } catch (err) {
+    console.error('Remove user error:', err);
+    return res.status(500).json({ error: 'Failed to remove user' });
   }
 });
 
@@ -252,9 +343,14 @@ router.put('/password', async (req, res) => {
     if (!valid) return res.status(400).json({ error: 'Current password is incorrect' });
 
     const password_hash = await bcrypt.hash(new_password, 12);
-    await prisma.user.update({
-      where: { id: req.user.userId },
-      data: { password_hash, refresh_token: null }, // invalidate existing sessions
+    await prisma.user.update({ where: { id: req.user.userId }, data: { password_hash } });
+    // sign out every OTHER device; keep the one that just changed the password
+    const currentToken = req.cookies?.refreshToken || req.body?.refreshToken;
+    await prisma.refreshSession.deleteMany({
+      where: {
+        user_id: req.user.userId,
+        ...(currentToken ? { token_hash: { not: sha256(currentToken) } } : {}),
+      },
     });
     return res.json({ message: 'Password updated successfully' });
   } catch (err) {

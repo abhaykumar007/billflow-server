@@ -3,6 +3,7 @@ const router = express.Router();
 const prisma = require('../utils/prisma');
 const { authenticateToken } = require('../middleware/auth');
 const { attachFinancialYear } = require('../middleware/financialYear');
+const { todayDate, monthStartDate, DAY_MS } = require('../utils/time');
 
 router.use(authenticateToken);
 
@@ -10,15 +11,16 @@ router.use(authenticateToken);
 router.get('/summary', attachFinancialYear, async (req, res) => {
   try {
     const businessId = req.user.businessId;
+    // "Today" / "this month" are IST calendar dates (the server clock is UTC).
+    const todayStart = todayDate();
+    const todayEnd = new Date(todayStart.getTime() + DAY_MS);
+    const monthStart = monthStartDate();
+
+    // Money owed to / by us is NOT limited to the selected year: an unpaid invoice from last
+    // year is still owed. Only date-bound figures use dates.
+    const openSale = { business_id: businessId, voucher_type: 'SALE', status: { in: ['sent', 'partial'] }, is_deleted: false };
+    const openPurchase = { business_id: businessId, voucher_type: 'PURCHASE', status: { in: ['sent', 'partial'] }, is_deleted: false };
     const fyFilter = req.financialYear ? { financial_year_id: req.financialYear.id } : {};
-    const now = new Date();
-
-    // Today: midnight to now
-    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    const todayEnd = new Date(todayStart.getTime() + 24 * 60 * 60 * 1000);
-
-    // This month: 1st of month to now
-    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
 
     // Run all queries in parallel
     const [
@@ -32,12 +34,13 @@ router.get('/summary', attachFinancialYear, async (req, res) => {
       recentInvoices,
       topCustomers,
       topSuppliers,
+      overdueResult,
+      lowStockRows,
     ] = await Promise.all([
       // Today's sales total (SALE invoices created today)
       prisma.invoice.aggregate({
         where: {
           business_id: businessId,
-          ...fyFilter,
           voucher_type: 'SALE',
           status: { in: ['sent', 'paid', 'partial'] },
           invoice_date: { gte: todayStart, lt: todayEnd },
@@ -50,7 +53,6 @@ router.get('/summary', attachFinancialYear, async (req, res) => {
       prisma.invoice.aggregate({
         where: {
           business_id: businessId,
-          ...fyFilter,
           voucher_type: 'PURCHASE',
           status: { in: ['sent', 'paid', 'partial'] },
           invoice_date: { gte: todayStart, lt: todayEnd },
@@ -63,7 +65,6 @@ router.get('/summary', attachFinancialYear, async (req, res) => {
       prisma.invoice.count({
         where: {
           business_id: businessId,
-          ...fyFilter,
           voucher_type: 'SALE',
           invoice_date: { gte: todayStart, lt: todayEnd },
           status: { not: 'cancelled' },
@@ -73,25 +74,13 @@ router.get('/summary', attachFinancialYear, async (req, res) => {
 
       // Total outstanding receivable (SALE balance due)
       prisma.invoice.aggregate({
-        where: {
-          business_id: businessId,
-          ...fyFilter,
-          voucher_type: 'SALE',
-          status: { in: ['sent', 'partial'] },
-          is_deleted: false,
-        },
+        where: openSale,
         _sum: { balance_due: true },
       }),
 
       // Total payable to suppliers (PURCHASE balance due)
       prisma.invoice.aggregate({
-        where: {
-          business_id: businessId,
-          ...fyFilter,
-          voucher_type: 'PURCHASE',
-          status: { in: ['sent', 'partial'] },
-          is_deleted: false,
-        },
+        where: openPurchase,
         _sum: { balance_due: true },
       }),
 
@@ -99,8 +88,8 @@ router.get('/summary', attachFinancialYear, async (req, res) => {
       prisma.payment.aggregate({
         where: {
           business_id: businessId,
-          ...fyFilter,
           party_type: 'CUSTOMER',
+          payment_type: 'RECEIVED', // refunds paid out for credit notes are not collections
           payment_date: { gte: monthStart },
           is_reversed: false,
         },
@@ -139,13 +128,7 @@ router.get('/summary', attachFinancialYear, async (req, res) => {
       // Top 5 customers by outstanding balance
       prisma.invoice.groupBy({
         by: ['customer_id'],
-        where: {
-          business_id: businessId,
-          ...fyFilter,
-          voucher_type: 'SALE',
-          status: { in: ['sent', 'partial'] },
-          is_deleted: false,
-        },
+        where: openSale,
         _sum: { balance_due: true },
         orderBy: { _sum: { balance_due: 'desc' } },
         take: 5,
@@ -154,16 +137,23 @@ router.get('/summary', attachFinancialYear, async (req, res) => {
       // Top 5 suppliers by outstanding payable
       prisma.invoice.groupBy({
         by: ['supplier_id'],
-        where: {
-          business_id: businessId,
-          ...fyFilter,
-          voucher_type: 'PURCHASE',
-          status: { in: ['sent', 'partial'] },
-          is_deleted: false,
-        },
+        where: openPurchase,
         _sum: { balance_due: true },
         orderBy: { _sum: { balance_due: 'desc' } },
         take: 5,
+      }),
+
+      // Overdue receivables (due date before today)
+      prisma.invoice.aggregate({
+        where: { ...openSale, due_date: { lt: todayStart } },
+        _count: { id: true },
+        _sum: { balance_due: true },
+      }),
+
+      // Low-stock products
+      prisma.product.findMany({
+        where: { business_id: businessId, is_deleted: false, is_active: true, track_inventory: true },
+        select: { stock_quantity: true, low_stock_alert: true },
       }),
     ]);
 
@@ -201,6 +191,9 @@ router.get('/summary', attachFinancialYear, async (req, res) => {
       totalPayable: totalPayableResult._sum.balance_due || 0,
       monthCollected: monthCollectedResult._sum.amount || 0,
       openEstimates: openEstimatesCount,
+      overdueCount: overdueResult._count.id || 0,
+      overdueAmount: overdueResult._sum.balance_due || 0,
+      lowStockCount: lowStockRows.filter((p) => p.stock_quantity <= p.low_stock_alert).length,
       recentInvoices,
       topCustomers: enrichedTopCustomers,
       topSuppliers: enrichedTopSuppliers,

@@ -85,11 +85,51 @@ model User {
   role          String    @default("owner")
   business_id   String
   refresh_token String?
+  sessions      RefreshSession[]
   created_at    DateTime  @default(now())
   updated_at    DateTime  @updatedAt
   invoices      Invoice[]       @relation("CreatedBy")
   closed_years  FinancialYear[] @relation("ClosedYears")
   business      Business        @relation(fields: [business_id], references: [id])
+
+  @@index([business_id])
+}
+
+model RefreshSession {
+  id          String   @id @default(cuid())
+  user_id     String
+  token_hash  String   @unique
+  device      String?
+  expires_at  DateTime
+  last_used_at DateTime @default(now())
+  created_at  DateTime @default(now())
+  user        User     @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@index([user_id])
+}
+
+model PasswordResetToken {
+  id         String    @id @default(cuid())
+  user_id    String
+  token_hash String    @unique
+  expires_at DateTime
+  used_at    DateTime?
+  created_at DateTime  @default(now())
+
+  @@index([user_id])
+}
+
+model SubscriptionPayment {
+  id                  String   @id @default(cuid())
+  business_id         String
+  plan                String
+  amount              Int
+  razorpay_order_id   String?
+  razorpay_payment_id String   @unique
+  source              String
+  created_at          DateTime @default(now())
+
+  @@index([business_id])
 }
 
 model Customer {
@@ -115,6 +155,8 @@ model Customer {
   invoices        Invoice[]
   ledgerEntries   LedgerEntry[]
   payments        Payment[]
+
+  @@index([business_id, is_deleted])
 }
 
 model Supplier {
@@ -139,6 +181,8 @@ model Supplier {
   payments        Payment[]
   business        Business              @relation(fields: [business_id], references: [id])
   ledgerEntries   SupplierLedgerEntry[]
+
+  @@index([business_id, is_deleted])
 }
 
 model SupplierLedgerEntry {
@@ -158,6 +202,8 @@ model SupplierLedgerEntry {
   business          Business       @relation(fields: [business_id], references: [id])
   financialYear     FinancialYear? @relation(fields: [financial_year_id], references: [id])
   supplier          Supplier       @relation(fields: [supplier_id], references: [id])
+
+  @@index([business_id, supplier_id, financial_year_id, created_at], map: "SupplierLedgerEntry_party_fy_created_idx")
 }
 
 model ProductCategory {
@@ -186,7 +232,7 @@ model Product {
   tax_rate        Float            @default(18)
   hsn_code        String?
   track_inventory Boolean          @default(false)
-  stock_quantity  Int              @default(0)
+  stock_quantity  Float            @default(0)
   low_stock_alert Int              @default(10)
   is_active       Boolean          @default(true)
   is_deleted      Boolean          @default(false)
@@ -195,6 +241,8 @@ model Product {
   invoiceItems    InvoiceItem[]
   business        Business         @relation(fields: [business_id], references: [id])
   category        ProductCategory? @relation(fields: [category_id], references: [id])
+
+  @@index([business_id, is_deleted])
 }
 
 model Invoice {
@@ -222,6 +270,7 @@ model Invoice {
   supplier_id       String?
   valid_until       DateTime?
   voucher_type      String         @default("SALE")
+  idempotency_key   String?
   business          Business       @relation(fields: [business_id], references: [id])
   creator           User           @relation("CreatedBy", fields: [created_by], references: [id])
   customer          Customer?      @relation(fields: [customer_id], references: [id])
@@ -233,6 +282,12 @@ model Invoice {
   payments          Payment[]
 
   @@unique([business_id, invoice_number])
+  @@unique([business_id, idempotency_key])
+  @@index([business_id, financial_year_id, voucher_type, status])
+  @@index([business_id, customer_id])
+  @@index([business_id, supplier_id])
+  @@index([business_id, invoice_date])
+  @@index([linked_invoice_id])
 }
 
 model InvoiceItem {
@@ -250,6 +305,9 @@ model InvoiceItem {
   created_at       DateTime @default(now())
   invoice          Invoice  @relation(fields: [invoice_id], references: [id])
   product          Product? @relation(fields: [product_id], references: [id])
+
+  @@index([invoice_id])
+  @@index([product_id])
 }
 
 model Payment {
@@ -269,6 +327,7 @@ model Payment {
   is_reversed               Boolean        @default(false)
   advance_payment           Boolean        @default(false)
   advance_balance_remaining Int            @default(0)
+  idempotency_key           String?
   created_at                DateTime       @default(now())
   financial_year_id         String?
   bankAccount               BankAccount?   @relation(fields: [bank_account_id], references: [id])
@@ -278,6 +337,13 @@ model Payment {
   financialYear             FinancialYear? @relation(fields: [financial_year_id], references: [id])
   invoice                   Invoice?       @relation(fields: [invoice_id], references: [id])
   splits                    PaymentSplit[]
+
+  @@unique([business_id, idempotency_key])
+  @@index([business_id, invoice_id])
+  @@index([business_id, customer_id])
+  @@index([business_id, supplier_id])
+  @@index([financial_year_id])
+  @@index([bank_account_id])
 }
 
 model PaymentSplit {
@@ -288,6 +354,7 @@ model PaymentSplit {
   payment      Payment @relation(fields: [payment_id], references: [id])
 
   @@map("payment_splits")
+  @@index([payment_id])
 }
 
 model LedgerEntry {
@@ -307,6 +374,8 @@ model LedgerEntry {
   business          Business       @relation(fields: [business_id], references: [id])
   customer          Customer       @relation(fields: [customer_id], references: [id])
   financialYear     FinancialYear? @relation(fields: [financial_year_id], references: [id])
+
+  @@index([business_id, customer_id, financial_year_id, created_at], map: "LedgerEntry_party_fy_created_idx")
 }
 
 model Expense {
@@ -326,6 +395,9 @@ model Expense {
   bankAccount       BankAccount?   @relation(fields: [bank_account_id], references: [id])
   business          Business       @relation(fields: [business_id], references: [id])
   financialYear     FinancialYear? @relation(fields: [financial_year_id], references: [id])
+
+  @@index([business_id, financial_year_id, expense_date])
+  @@index([bank_account_id])
 }
 
 model Subscription {
@@ -360,6 +432,7 @@ model BankAccount {
   transfersTo     FundTransfer[] @relation("TransferTo")
 
   @@map("bank_accounts")
+  @@index([business_id])
 }
 
 model FundTransfer {
@@ -377,4 +450,7 @@ model FundTransfer {
   to_account       BankAccount @relation("TransferTo", fields: [to_account_id], references: [id])
 
   @@map("fund_transfers")
+  @@index([business_id])
+  @@index([from_account_id])
+  @@index([to_account_id])
 }

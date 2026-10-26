@@ -1,149 +1,102 @@
 const express = require('express');
 const router = express.Router();
 const prisma = require('../utils/prisma');
-const { authenticateToken } = require('../middleware/auth');
+const { authenticateToken, requireRole, MANAGERS } = require('../middleware/auth');
+const { HttpError } = require('../utils/httpError');
+const { computeBalance, computeBalances } = require('../utils/bank');
+const { parseDayStart, parseDayEnd } = require('../utils/time');
+const { rupeesToPaise } = require('../utils/validate');
 
 router.use(authenticateToken);
-
-// Compute current balance for a bank account dynamically
-async function computeBalance(bankAccountId, businessId) {
-  const [account, paymentsIn, paymentsOut, expensesOut, transfersIn, transfersOut] = await Promise.all([
-    prisma.bankAccount.findFirst({
-      where: { id: bankAccountId, business_id: businessId },
-      select: { opening_balance: true },
-    }),
-    prisma.payment.aggregate({
-      where: { bank_account_id: bankAccountId, business_id: businessId, payment_type: 'RECEIVED', is_reversed: false },
-      _sum: { amount: true },
-    }),
-    prisma.payment.aggregate({
-      where: { bank_account_id: bankAccountId, business_id: businessId, payment_type: 'PAID', is_reversed: false },
-      _sum: { amount: true },
-    }),
-    prisma.expense.aggregate({
-      where: { bank_account_id: bankAccountId, business_id: businessId, is_deleted: false },
-      _sum: { amount: true },
-    }),
-    prisma.fundTransfer.aggregate({
-      where: { to_account_id: bankAccountId, business_id: businessId },
-      _sum: { amount: true },
-    }),
-    prisma.fundTransfer.aggregate({
-      where: { from_account_id: bankAccountId, business_id: businessId },
-      _sum: { amount: true },
-    }),
-  ]);
-
-  if (!account) return null;
-  return (account.opening_balance || 0)
-    + (paymentsIn._sum.amount || 0)
-    - (paymentsOut._sum.amount || 0)
-    - (expensesOut._sum.amount || 0)
-    + (transfersIn._sum.amount || 0)
-    - (transfersOut._sum.amount || 0);
-}
 
 // GET /api/bank-accounts
 router.get('/', async (req, res) => {
   const businessId = req.user.businessId;
-  try {
-    const accounts = await prisma.bankAccount.findMany({
-      where: { business_id: businessId, is_deleted: false },
-      orderBy: { created_at: 'asc' },
-    });
-
-    // Attach computed balance to each account
-    const withBalance = await Promise.all(
-      accounts.map(async (acc) => ({
-        ...acc,
-        current_balance: await computeBalance(acc.id, businessId),
-      }))
-    );
-
-    return res.json(withBalance);
-  } catch (err) {
-    console.error('Bank accounts list error:', err);
-    return res.status(500).json({ error: 'Failed to fetch bank accounts' });
-  }
+  const accounts = await prisma.bankAccount.findMany({
+    where: { business_id: businessId, is_deleted: false },
+    orderBy: { created_at: 'asc' },
+  });
+  const balances = await computeBalances(prisma, businessId, accounts.map((a) => a.id));
+  return res.json(accounts.map((acc) => ({ ...acc, current_balance: balances.get(acc.id) ?? 0 })));
 });
 
 // POST /api/bank-accounts
-router.post('/', async (req, res) => {
+router.post('/', requireRole(...MANAGERS), async (req, res) => {
   const { account_name, bank_name, account_number, ifsc_code, opening_balance } = req.body;
   const businessId = req.user.businessId;
 
-  if (!account_name?.trim()) return res.status(400).json({ error: 'Account name is required' });
+  if (!account_name?.trim()) throw new HttpError(400, 'Account name is required', 'VALIDATION');
+  const ifsc = ifsc_code?.trim().toUpperCase() || null;
+  if (ifsc && !/^[A-Z]{4}0[A-Z0-9]{6}$/.test(ifsc)) throw new HttpError(400, 'Enter a valid IFSC code', 'VALIDATION');
+  const openingPaise = rupeesToPaise(opening_balance, 'opening balance');
 
-  const openingPaise = opening_balance ? Math.round(parseFloat(opening_balance) * 100) : 0;
+  const dup = await prisma.bankAccount.findFirst({
+    where: { business_id: businessId, is_deleted: false, account_name: { equals: account_name.trim(), mode: 'insensitive' } },
+    select: { id: true },
+  });
+  if (dup) throw new HttpError(409, 'A bank account with this name already exists', 'DUPLICATE');
 
-  try {
-    const account = await prisma.bankAccount.create({
-      data: {
-        business_id: businessId,
-        account_name: account_name.trim(),
-        bank_name: bank_name?.trim() || null,
-        account_number: account_number?.trim() || null,
-        ifsc_code: ifsc_code?.trim() || null,
-        opening_balance: openingPaise,
-        current_balance: openingPaise,
-      },
-    });
-    return res.status(201).json({ ...account, current_balance: openingPaise });
-  } catch (err) {
-    console.error('Create bank account error:', err);
-    return res.status(500).json({ error: 'Failed to create bank account' });
-  }
+  const account = await prisma.bankAccount.create({
+    data: {
+      business_id: businessId,
+      account_name: account_name.trim(),
+      bank_name: bank_name?.trim() || null,
+      account_number: account_number?.trim() || null,
+      ifsc_code: ifsc,
+      opening_balance: openingPaise,
+      current_balance: openingPaise,
+    },
+  });
+  return res.status(201).json({ ...account, current_balance: openingPaise });
 });
 
 // PUT /api/bank-accounts/:id
-router.put('/:id', async (req, res) => {
+router.put('/:id', requireRole(...MANAGERS), async (req, res) => {
   const { account_name, bank_name, account_number, ifsc_code, opening_balance, is_active } = req.body;
   const businessId = req.user.businessId;
 
-  try {
-    const existing = await prisma.bankAccount.findFirst({
-      where: { id: req.params.id, business_id: businessId, is_deleted: false },
-    });
-    if (!existing) return res.status(404).json({ error: 'Bank account not found' });
+  const existing = await prisma.bankAccount.findFirst({
+    where: { id: req.params.id, business_id: businessId, is_deleted: false },
+  });
+  if (!existing) throw new HttpError(404, 'Bank account not found', 'NOT_FOUND');
 
-    const data = {};
-    if (account_name !== undefined) data.account_name = account_name.trim();
-    if (bank_name !== undefined) data.bank_name = bank_name?.trim() || null;
-    if (account_number !== undefined) data.account_number = account_number?.trim() || null;
-    if (ifsc_code !== undefined) data.ifsc_code = ifsc_code?.trim() || null;
-    if (opening_balance !== undefined) {
-      data.opening_balance = Math.round(parseFloat(opening_balance) * 100);
-      data.current_balance = data.opening_balance;
-    }
-    if (is_active !== undefined) data.is_active = is_active;
-
-    const account = await prisma.bankAccount.update({ where: { id: req.params.id }, data });
-    const current_balance = await computeBalance(account.id, businessId);
-    return res.json({ ...account, current_balance });
-  } catch (err) {
-    console.error('Update bank account error:', err);
-    return res.status(500).json({ error: 'Failed to update bank account' });
+  const data = {};
+  if (account_name !== undefined) {
+    if (!account_name.trim()) throw new HttpError(400, 'Account name cannot be empty', 'VALIDATION');
+    data.account_name = account_name.trim();
   }
+  if (bank_name !== undefined) data.bank_name = bank_name?.trim() || null;
+  if (account_number !== undefined) data.account_number = account_number?.trim() || null;
+  if (ifsc_code !== undefined) {
+    const ifsc = ifsc_code?.trim().toUpperCase() || null;
+    if (ifsc && !/^[A-Z]{4}0[A-Z0-9]{6}$/.test(ifsc)) throw new HttpError(400, 'Enter a valid IFSC code', 'VALIDATION');
+    data.ifsc_code = ifsc;
+  }
+  if (opening_balance !== undefined) {
+    data.opening_balance = rupeesToPaise(opening_balance, 'opening balance');
+    data.current_balance = data.opening_balance;
+  }
+  if (is_active !== undefined) data.is_active = Boolean(is_active);
+
+  const account = await prisma.bankAccount.update({ where: { id: req.params.id }, data });
+  const current_balance = await computeBalance(prisma, account.id, businessId);
+  return res.json({ ...account, current_balance });
 });
 
-// DELETE /api/bank-accounts/:id
-router.delete('/:id', async (req, res) => {
+// DELETE /api/bank-accounts/:id - only an empty account (zero balance) can be removed
+router.delete('/:id', requireRole(...MANAGERS), async (req, res) => {
   const businessId = req.user.businessId;
-  try {
-    const existing = await prisma.bankAccount.findFirst({
-      where: { id: req.params.id, business_id: businessId, is_deleted: false },
-    });
-    if (!existing) return res.status(404).json({ error: 'Bank account not found' });
+  const existing = await prisma.bankAccount.findFirst({
+    where: { id: req.params.id, business_id: businessId, is_deleted: false },
+  });
+  if (!existing) throw new HttpError(404, 'Bank account not found', 'NOT_FOUND');
 
-    await prisma.bankAccount.update({
-      where: { id: req.params.id },
-      data: { is_deleted: true },
-    });
-    return res.json({ message: 'Bank account deleted' });
-  } catch (err) {
-    console.error('Delete bank account error:', err);
-    return res.status(500).json({ error: 'Failed to delete bank account' });
+  const balance = await computeBalance(prisma, existing.id, businessId);
+  if (balance !== 0) {
+    throw new HttpError(409, `This account still has a balance of ₹${(balance / 100).toFixed(2)}. Transfer it out first.`, 'NON_ZERO_BALANCE');
   }
+  await prisma.bankAccount.update({ where: { id: req.params.id }, data: { is_deleted: true } });
+  return res.json({ message: 'Bank account deleted' });
 });
 
 // GET /api/bank-accounts/:id/transactions
@@ -159,8 +112,8 @@ router.get('/:id/transactions', async (req, res) => {
     if (!account) return res.status(404).json({ error: 'Bank account not found' });
 
     const dateFilter = {};
-    if (from) dateFilter.gte = new Date(from);
-    if (to) dateFilter.lte = new Date(to + 'T23:59:59');
+    if (from) dateFilter.gte = parseDayStart(from);
+    if (to) dateFilter.lte = parseDayEnd(to);
 
     const [payments, expenses, transfersFrom, transfersTo] = await Promise.all([
       prisma.payment.findMany({
@@ -257,7 +210,7 @@ router.get('/:id/transactions', async (req, res) => {
     // Sort descending by date
     txns.sort((a, b) => new Date(b.date) - new Date(a.date));
 
-    const current_balance = await computeBalance(req.params.id, businessId);
+    const current_balance = await computeBalance(prisma, req.params.id, businessId);
     return res.json({ account: { ...account, current_balance }, transactions: txns });
   } catch (err) {
     console.error('Bank account transactions error:', err);
@@ -266,79 +219,85 @@ router.get('/:id/transactions', async (req, res) => {
 });
 
 // GET /api/bank-accounts/cash-book
-// Cash book = all payments/expenses with payment_mode='cash' and no bank_account_id
+// Cash book = every CASH movement not tied to a bank account: cash payments (incl. the cash
+// part of split payments) and cash expenses. It is continuous across financial years, with
+// an opening balance (all cash before `from`) and a running balance on every line.
 router.get('/cash-book', async (req, res) => {
   const businessId = req.user.businessId;
   const { from, to } = req.query;
+  const fromD = from ? parseDayStart(from) : null;
+  const toD = to ? parseDayEnd(to) : null;
 
-  const dateFilter = {};
-  if (from) dateFilter.gte = new Date(from);
-  if (to) dateFilter.lte = new Date(to + 'T23:59:59');
+  const payWhere = {
+    business_id: businessId,
+    bank_account_id: null,
+    is_reversed: false,
+    OR: [{ payment_mode: 'cash' }, { splits: { some: { payment_mode: 'cash' } } }],
+  };
+  const expWhere = { business_id: businessId, payment_mode: 'cash', bank_account_id: null, is_deleted: false };
 
-  try {
-    const [payments, expenses] = await Promise.all([
-      prisma.payment.findMany({
-        where: {
-          business_id: businessId,
-          payment_mode: 'cash',
-          bank_account_id: null,
-          is_reversed: false,
-          ...(Object.keys(dateFilter).length && { payment_date: dateFilter }),
-        },
-        include: {
-          customer: { select: { name: true } },
-          supplier: { select: { name: true } },
-          invoice: { select: { invoice_number: true } },
-        },
-        orderBy: { payment_date: 'desc' },
-      }),
-      prisma.expense.findMany({
-        where: {
-          business_id: businessId,
-          payment_mode: 'cash',
-          bank_account_id: null,
-          is_deleted: false,
-          ...(Object.keys(dateFilter).length && { expense_date: dateFilter }),
-        },
-        orderBy: { expense_date: 'desc' },
-      }),
-    ]);
+  const [payments, expenses] = await Promise.all([
+    prisma.payment.findMany({
+      where: payWhere,
+      include: {
+        customer: { select: { name: true } },
+        supplier: { select: { name: true } },
+        invoice: { select: { invoice_number: true } },
+        splits: true,
+      },
+      orderBy: [{ payment_date: 'asc' }, { created_at: 'asc' }],
+    }),
+    prisma.expense.findMany({ where: expWhere, orderBy: [{ expense_date: 'asc' }, { created_at: 'asc' }] }),
+  ]);
 
-    const txns = [
-      ...payments.map((p) => ({
-        id: p.id,
-        type: 'payment',
-        date: p.payment_date,
-        narration: p.customer
-          ? `Receipt from ${p.customer.name}${p.invoice ? ` (#${p.invoice.invoice_number})` : ''}`
-          : p.supplier
-          ? `Payment to ${p.supplier.name}${p.invoice ? ` (#${p.invoice.invoice_number})` : ''}`
-          : 'Payment',
-        debit: p.payment_type === 'PAID' ? p.amount : 0,
-        credit: p.payment_type === 'RECEIVED' ? p.amount : 0,
+  // cash portion of a payment: whole amount if paid in cash, else the cash splits
+  const cashPart = (p) => (p.payment_mode === 'cash'
+    ? p.amount
+    : p.splits.filter((x) => x.payment_mode === 'cash').reduce((sum, x) => sum + x.amount, 0));
+
+  const all = [
+    ...payments.map((p) => {
+      const cash = cashPart(p);
+      return {
+        id: p.id, type: 'payment', date: p.payment_date,
+        narration: p.payment_type === 'PAID'
+          ? `Payment to ${p.supplier?.name || p.customer?.name || 'party'}${p.invoice ? ` (#${p.invoice.invoice_number})` : ''}`
+          : `Receipt from ${p.customer?.name || p.supplier?.name || 'party'}${p.invoice ? ` (#${p.invoice.invoice_number})` : ''}`,
+        debit: p.payment_type === 'PAID' ? cash : 0,      // cash out
+        credit: p.payment_type === 'RECEIVED' ? cash : 0, // cash in
         reference: p.reference_number,
-      })),
-      ...expenses.map((e) => ({
-        id: e.id,
-        type: 'expense',
-        date: e.expense_date,
-        narration: `Expense – ${e.category}${e.description ? ': ' + e.description : ''}`,
-        debit: e.amount,
-        credit: 0,
-        reference: null,
-      })),
-    ];
+      };
+    }),
+    ...expenses.map((e) => ({
+      id: e.id, type: 'expense', date: e.expense_date,
+      narration: `Expense – ${e.category}${e.description ? ': ' + e.description : ''}`,
+      debit: e.amount, credit: 0, reference: null,
+    })),
+  ].sort((a, b) => new Date(a.date) - new Date(b.date));
 
-    txns.sort((a, b) => new Date(b.date) - new Date(a.date));
-
-    const totalDebit = txns.reduce((s, t) => s + t.debit, 0);
-    const totalCredit = txns.reduce((s, t) => s + t.credit, 0);
-
-    return res.json({ transactions: txns, totalDebit, totalCredit });
-  } catch (err) {
-    console.error('Cash book error:', err);
-    return res.status(500).json({ error: 'Failed to fetch cash book' });
+  let opening = 0;
+  const inRange = [];
+  for (const t of all) {
+    const d = new Date(t.date);
+    if (fromD && d < fromD) opening += t.credit - t.debit;
+    else if (!toD || d <= toD) inRange.push(t);
   }
+  let running = opening;
+  const transactions = inRange.map((t) => {
+    running += t.credit - t.debit;
+    return { ...t, balance: running };
+  });
+  const totalDebit = inRange.reduce((s, t) => s + t.debit, 0);
+  const totalCredit = inRange.reduce((s, t) => s + t.credit, 0);
+
+  // newest first for display, like the other books
+  return res.json({
+    transactions: transactions.reverse(),
+    totalDebit,
+    totalCredit,
+    opening_balance: opening,
+    closing_balance: running,
+  });
 });
 
 module.exports = router;

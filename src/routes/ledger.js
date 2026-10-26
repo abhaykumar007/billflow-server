@@ -3,327 +3,222 @@ const router = express.Router();
 const prisma = require('../utils/prisma');
 const { authenticateToken } = require('../middleware/auth');
 const { attachFinancialYear } = require('../middleware/financialYear');
+const { parseDayStart, parseDayEnd } = require('../utils/time');
 
 router.use(authenticateToken);
 router.use(attachFinancialYear);
 
+// Running balances are always RECOMPUTED here from debit/credit in (entry_date, created_at)
+// order, so back-dated entries can never leave the displayed running balance out of order.
+//   customer: + = customer owes us    (debit − credit)
+//   supplier: + = we owe the supplier (credit − debit)
+function withRunningBalance(entries, opening, sign) {
+  let running = opening;
+  return entries.map((e) => {
+    running += sign * (e.debit - e.credit);
+    return { ...e, balance: running };
+  });
+}
+
+const orderAsc = [{ entry_date: 'asc' }, { created_at: 'asc' }, { id: 'asc' }];
+
+function dateRange(from, to) {
+  if (!from && !to) return undefined;
+  return {
+    ...(from ? { gte: parseDayStart(from) } : {}),
+    ...(to ? { lte: parseDayEnd(to) } : {}),
+  };
+}
+
 // GET /api/ledger — combined customer ledger entries (used by Payments page Ledger tab)
 router.get('/', async (req, res) => {
   const businessId = req.user.businessId;
-  const { customer_id, from, to, limit = 100 } = req.query;
+  const { customer_id, from, to } = req.query;
+  const limit = Math.min(Math.max(parseInt(req.query.limit) || 100, 1), 500);
 
-  try {
-    const where = {
-      business_id: businessId,
-      ...(req.financialYear ? { financial_year_id: req.financialYear.id } : {}),
-      ...(customer_id ? { customer_id } : {}),
-      ...(from || to
-        ? {
-            entry_date: {
-              ...(from ? { gte: new Date(from) } : {}),
-              ...(to ? { lte: new Date(to + 'T23:59:59') } : {}),
-            },
-          }
-        : {}),
-    };
+  const where = {
+    business_id: businessId,
+    ...(req.financialYear ? { financial_year_id: req.financialYear.id } : {}),
+    ...(customer_id ? { customer_id } : {}),
+    ...(from || to ? { entry_date: dateRange(from, to) } : {}),
+  };
 
-    const [entries, total] = await Promise.all([
-      prisma.ledgerEntry.findMany({
-        where,
-        orderBy: [{ entry_date: 'desc' }, { created_at: 'desc' }],
-        take: parseInt(limit),
-        include: { customer: { select: { id: true, name: true } } },
-      }),
-      prisma.ledgerEntry.count({ where }),
-    ]);
-
-    return res.json({ entries, total });
-  } catch (err) {
-    console.error('Ledger root error:', err);
-    return res.status(500).json({ error: 'Failed to fetch ledger entries' });
-  }
+  const [entries, total] = await Promise.all([
+    prisma.ledgerEntry.findMany({
+      where,
+      orderBy: [{ entry_date: 'desc' }, { created_at: 'desc' }],
+      take: limit,
+      include: { customer: { select: { id: true, name: true } } },
+    }),
+    prisma.ledgerEntry.count({ where }),
+  ]);
+  return res.json({ entries, total });
 });
 
 // ── Customer Ledger ───────────────────────────────────────────────────────────
 
-// GET /api/ledger/customers — list all customers with their current balance
+// GET /api/ledger/customers — all customers with their balance in the selected year
 router.get('/customers', async (req, res) => {
   const businessId = req.user.businessId;
   const { search = '' } = req.query;
 
-  try {
-    const customers = await prisma.customer.findMany({
+  const [customers, totals] = await Promise.all([
+    prisma.customer.findMany({
       where: {
         business_id: businessId,
         is_deleted: false,
         ...(search
-          ? {
-              OR: [
-                { name: { contains: search, mode: 'insensitive' } },
-                { phone: { contains: search, mode: 'insensitive' } },
-              ],
-            }
+          ? { OR: [{ name: { contains: search, mode: 'insensitive' } }, { phone: { contains: search, mode: 'insensitive' } }] }
           : {}),
       },
       orderBy: { name: 'asc' },
-      select: {
-        id: true,
-        name: true,
-        phone: true,
-        email: true,
-        city: true,
-        opening_balance: true,
-        balance_type: true,
-        ledgerEntries: {
-          where: req.financialYear ? { financial_year_id: req.financialYear.id } : undefined,
-          orderBy: { created_at: 'desc' },
-          take: 1,
-          select: { balance: true },
-        },
-      },
-    });
+      select: { id: true, name: true, phone: true, email: true, city: true, opening_balance: true, balance_type: true },
+    }),
+    prisma.ledgerEntry.groupBy({
+      by: ['customer_id'],
+      where: { business_id: businessId, ...(req.financialYear ? { financial_year_id: req.financialYear.id } : {}) },
+      _sum: { debit: true, credit: true },
+    }),
+  ]);
+  const balanceOf = new Map(totals.map((t) => [t.customer_id, (t._sum.debit || 0) - (t._sum.credit || 0)]));
 
-    const result = customers.map((c) => ({
-      id: c.id,
-      name: c.name,
-      phone: c.phone,
-      email: c.email,
-      city: c.city,
-      // Last entry balance is the running balance; fall back to opening_balance
-      balance: c.ledgerEntries.length > 0 ? c.ledgerEntries[0].balance : c.opening_balance,
-      balance_type: c.balance_type,
-    }));
-
-    return res.json({ customers: result, total: result.length });
-  } catch (err) {
-    console.error('Ledger customers list error:', err);
-    return res.status(500).json({ error: 'Failed to fetch customer balances' });
-  }
+  const result = customers.map((c) => ({
+    id: c.id, name: c.name, phone: c.phone, email: c.email, city: c.city,
+    balance: balanceOf.get(c.id) || 0,
+    balance_type: c.balance_type,
+  }));
+  return res.json({ customers: result, total: result.length });
 });
 
 // GET /api/ledger/customers/:id — full ledger for one customer
 router.get('/customers/:id', async (req, res) => {
   const businessId = req.user.businessId;
   const { from, to } = req.query;
-  const financial_year_id = req.query.financial_year_id || req.financialYear?.id || null;
+  const fyId = req.query.financial_year_id || req.financialYear?.id || null;
 
-  try {
-    const customer = await prisma.customer.findFirst({
-      where: { id: req.params.id, business_id: businessId, is_deleted: false },
-      select: {
-        id: true,
-        name: true,
-        phone: true,
-        email: true,
-        address: true,
-        city: true,
-        state: true,
-        gstin: true,
-        opening_balance: true,
-        balance_type: true,
-      },
+  const customer = await prisma.customer.findFirst({
+    where: { id: req.params.id, business_id: businessId, is_deleted: false },
+    select: {
+      id: true, name: true, phone: true, email: true, address: true, city: true, state: true,
+      gstin: true, opening_balance: true, balance_type: true,
+    },
+  });
+  if (!customer) return res.status(404).json({ error: 'Customer not found' });
+
+  const base = { business_id: businessId, customer_id: req.params.id, ...(fyId ? { financial_year_id: fyId } : {}) };
+
+  // Opening for the view = everything in the year before `from` (the year's own
+  // carry-forward / opening-balance lines are ordinary entries and are included).
+  let opening = 0;
+  if (from) {
+    const before = await prisma.ledgerEntry.aggregate({
+      where: { ...base, entry_date: { lt: parseDayStart(from) } },
+      _sum: { debit: true, credit: true },
     });
-    if (!customer) return res.status(404).json({ error: 'Customer not found' });
-
-    const where = {
-      business_id: businessId,
-      customer_id: req.params.id,
-    };
-    if (financial_year_id) where.financial_year_id = financial_year_id;
-    if (from || to) {
-      where.entry_date = {};
-      if (from) where.entry_date.gte = new Date(from);
-      if (to) where.entry_date.lte = new Date(to + 'T23:59:59');
-    }
-
-    const entries = await prisma.ledgerEntry.findMany({
-      where,
-      orderBy: [{ entry_date: 'asc' }, { created_at: 'asc' }],
-    });
-
-    // Opening balance for this view:
-    // - If the current FY has a carry_forward entry, that entry IS the opening balance
-    //   (it's already included in entries), so opening = 0 to avoid double-counting.
-    // - Otherwise fall back to the closing balance of the prior FY, or the customer's
-    //   initial opening_balance if no prior entries exist.
-    let openingBalance = customer.opening_balance;
-    if (financial_year_id) {
-      const carryForwardEntry = entries.find((e) => e.reference_type === 'carry_forward');
-      if (carryForwardEntry) {
-        openingBalance = 0;
-      } else {
-        const prevEntry = await prisma.ledgerEntry.findFirst({
-          where: {
-            business_id: businessId,
-            customer_id: req.params.id,
-            financial_year_id: { not: financial_year_id },
-          },
-          orderBy: { created_at: 'desc' },
-        });
-        if (prevEntry) openingBalance = prevEntry.balance;
-      }
-    }
-
-    const totalDebit = entries.reduce((s, e) => s + e.debit, 0);
-    const totalCredit = entries.reduce((s, e) => s + e.credit, 0);
-    const closingBalance =
-      entries.length > 0 ? entries[entries.length - 1].balance : openingBalance;
-
-    return res.json({
-      customer,
-      entries,
-      summary: {
-        opening_balance: openingBalance,
-        total_debit: totalDebit,
-        total_credit: totalCredit,
-        closing_balance: closingBalance,
-      },
-    });
-  } catch (err) {
-    console.error('Customer ledger detail error:', err);
-    return res.status(500).json({ error: 'Failed to fetch customer ledger' });
+    opening = (before._sum.debit || 0) - (before._sum.credit || 0);
   }
+
+  const raw = await prisma.ledgerEntry.findMany({
+    where: { ...base, ...(from || to ? { entry_date: dateRange(from, to) } : {}) },
+    orderBy: orderAsc,
+  });
+  const entries = withRunningBalance(raw, opening, +1);
+
+  const totalDebit = raw.reduce((s, e) => s + e.debit, 0);
+  const totalCredit = raw.reduce((s, e) => s + e.credit, 0);
+
+  return res.json({
+    customer,
+    entries,
+    summary: {
+      opening_balance: opening,
+      total_debit: totalDebit,
+      total_credit: totalCredit,
+      closing_balance: opening + totalDebit - totalCredit,
+    },
+  });
 });
 
 // ── Supplier Ledger ───────────────────────────────────────────────────────────
 
-// GET /api/ledger/suppliers — list all suppliers with their current balance
+// GET /api/ledger/suppliers — all suppliers with their balance in the selected year
 router.get('/suppliers', async (req, res) => {
   const businessId = req.user.businessId;
   const { search = '' } = req.query;
 
-  try {
-    const suppliers = await prisma.supplier.findMany({
+  const [suppliers, totals] = await Promise.all([
+    prisma.supplier.findMany({
       where: {
         business_id: businessId,
         is_deleted: false,
         ...(search
-          ? {
-              OR: [
-                { name: { contains: search, mode: 'insensitive' } },
-                { phone: { contains: search, mode: 'insensitive' } },
-              ],
-            }
+          ? { OR: [{ name: { contains: search, mode: 'insensitive' } }, { phone: { contains: search, mode: 'insensitive' } }] }
           : {}),
       },
       orderBy: { name: 'asc' },
-      select: {
-        id: true,
-        name: true,
-        phone: true,
-        email: true,
-        city: true,
-        opening_balance: true,
-        balance_type: true,
-        ledgerEntries: {
-          where: req.financialYear ? { financial_year_id: req.financialYear.id } : undefined,
-          orderBy: { created_at: 'desc' },
-          take: 1,
-          select: { balance: true },
-        },
-      },
-    });
+      select: { id: true, name: true, phone: true, email: true, city: true, opening_balance: true, balance_type: true },
+    }),
+    prisma.supplierLedgerEntry.groupBy({
+      by: ['supplier_id'],
+      where: { business_id: businessId, ...(req.financialYear ? { financial_year_id: req.financialYear.id } : {}) },
+      _sum: { debit: true, credit: true },
+    }),
+  ]);
+  const balanceOf = new Map(totals.map((t) => [t.supplier_id, (t._sum.credit || 0) - (t._sum.debit || 0)]));
 
-    const result = suppliers.map((s) => ({
-      id: s.id,
-      name: s.name,
-      phone: s.phone,
-      email: s.email,
-      city: s.city,
-      balance: s.ledgerEntries.length > 0 ? s.ledgerEntries[0].balance : s.opening_balance,
-      balance_type: s.balance_type,
-    }));
-
-    return res.json({ suppliers: result, total: result.length });
-  } catch (err) {
-    console.error('Ledger suppliers list error:', err);
-    return res.status(500).json({ error: 'Failed to fetch supplier balances' });
-  }
+  const result = suppliers.map((s) => ({
+    id: s.id, name: s.name, phone: s.phone, email: s.email, city: s.city,
+    balance: balanceOf.get(s.id) || 0, // + = payable
+    balance_type: s.balance_type,
+  }));
+  return res.json({ suppliers: result, total: result.length });
 });
 
 // GET /api/ledger/suppliers/:id — full ledger for one supplier
 router.get('/suppliers/:id', async (req, res) => {
   const businessId = req.user.businessId;
   const { from, to } = req.query;
-  const financial_year_id = req.query.financial_year_id || req.financialYear?.id || null;
+  const fyId = req.query.financial_year_id || req.financialYear?.id || null;
 
-  try {
-    const supplier = await prisma.supplier.findFirst({
-      where: { id: req.params.id, business_id: businessId, is_deleted: false },
-      select: {
-        id: true,
-        name: true,
-        phone: true,
-        email: true,
-        address: true,
-        city: true,
-        state: true,
-        gstin: true,
-        pan: true,
-        opening_balance: true,
-        balance_type: true,
-      },
+  const supplier = await prisma.supplier.findFirst({
+    where: { id: req.params.id, business_id: businessId, is_deleted: false },
+    select: {
+      id: true, name: true, phone: true, email: true, address: true, city: true, state: true,
+      gstin: true, pan: true, opening_balance: true, balance_type: true,
+    },
+  });
+  if (!supplier) return res.status(404).json({ error: 'Supplier not found' });
+
+  const base = { business_id: businessId, supplier_id: req.params.id, ...(fyId ? { financial_year_id: fyId } : {}) };
+
+  let opening = 0;
+  if (from) {
+    const before = await prisma.supplierLedgerEntry.aggregate({
+      where: { ...base, entry_date: { lt: parseDayStart(from) } },
+      _sum: { debit: true, credit: true },
     });
-    if (!supplier) return res.status(404).json({ error: 'Supplier not found' });
-
-    const where = {
-      business_id: businessId,
-      supplier_id: req.params.id,
-    };
-    if (financial_year_id) where.financial_year_id = financial_year_id;
-    if (from || to) {
-      where.entry_date = {};
-      if (from) where.entry_date.gte = new Date(from);
-      if (to) where.entry_date.lte = new Date(to + 'T23:59:59');
-    }
-
-    const entries = await prisma.supplierLedgerEntry.findMany({
-      where,
-      orderBy: [{ entry_date: 'asc' }, { created_at: 'asc' }],
-    });
-
-    // Opening balance for this view:
-    // - If the current FY has a carry_forward entry, that entry IS the opening balance
-    //   (it's already included in entries), so opening = 0 to avoid double-counting.
-    // - Otherwise fall back to the closing balance of the prior FY, or the supplier's
-    //   initial opening_balance if no prior entries exist.
-    let openingBalance = supplier.opening_balance;
-    if (financial_year_id) {
-      const carryForwardEntry = entries.find((e) => e.reference_type === 'carry_forward');
-      if (carryForwardEntry) {
-        openingBalance = 0;
-      } else {
-        const prevEntry = await prisma.supplierLedgerEntry.findFirst({
-          where: {
-            business_id: businessId,
-            supplier_id: req.params.id,
-            financial_year_id: { not: financial_year_id },
-          },
-          orderBy: { created_at: 'desc' },
-        });
-        if (prevEntry) openingBalance = prevEntry.balance;
-      }
-    }
-
-    const totalDebit = entries.reduce((s, e) => s + e.debit, 0);
-    const totalCredit = entries.reduce((s, e) => s + e.credit, 0);
-    const closingBalance =
-      entries.length > 0 ? entries[entries.length - 1].balance : openingBalance;
-
-    return res.json({
-      supplier,
-      entries,
-      summary: {
-        opening_balance: openingBalance,
-        total_debit: totalDebit,
-        total_credit: totalCredit,
-        closing_balance: closingBalance,
-      },
-    });
-  } catch (err) {
-    console.error('Supplier ledger detail error:', err);
-    return res.status(500).json({ error: 'Failed to fetch supplier ledger' });
+    opening = (before._sum.credit || 0) - (before._sum.debit || 0);
   }
+
+  const raw = await prisma.supplierLedgerEntry.findMany({
+    where: { ...base, ...(from || to ? { entry_date: dateRange(from, to) } : {}) },
+    orderBy: orderAsc,
+  });
+  const entries = withRunningBalance(raw, opening, -1);
+
+  const totalDebit = raw.reduce((s, e) => s + e.debit, 0);
+  const totalCredit = raw.reduce((s, e) => s + e.credit, 0);
+
+  return res.json({
+    supplier,
+    entries,
+    summary: {
+      opening_balance: opening,
+      total_debit: totalDebit,
+      total_credit: totalCredit,
+      closing_balance: opening + totalCredit - totalDebit,
+    },
+  });
 });
 
 module.exports = router;
