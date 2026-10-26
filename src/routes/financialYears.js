@@ -279,6 +279,16 @@ router.post('/:id/close', requireRole(...MANAGERS), async (req, res) => {
     if (!fy.is_active) return res.status(400).json({ error: 'Only the active financial year can be closed' });
     if (fy.is_closed) return res.status(400).json({ error: 'Financial year is already closed' });
 
+    // Closing is irreversible and blocks every entry dated inside the year. Doing it before the year
+    // has ended would stop the business from recording today's sales, so it needs an explicit confirmation.
+    if (new Date(fy.end_date) > new Date() && req.body?.confirm_early !== true) {
+      const endsOn = new Date(fy.end_date).toISOString().slice(0, 10);
+      return res.status(409).json({
+        error: `${fy.label} runs until ${endsOn}. Once it is closed, no transactions dated in it can be recorded until the next year starts. Close it after it has ended.`,
+        code: 'FY_NOT_ENDED',
+      });
+    }
+
     // If not forcing, check for pending items
     if (!force) {
       const [unpaidCount, openAdvances, openEstimates] = await Promise.all([
