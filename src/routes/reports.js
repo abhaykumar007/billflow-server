@@ -631,7 +631,7 @@ router.get('/day-book', async (req, res) => {
     };
 
     return res.json({
-      date: targetDate.toISOString().split('T')[0],
+      date: dayStart.toISOString().split('T')[0],
       entries: outputEntries,
       totals,
     });
