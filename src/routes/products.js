@@ -149,6 +149,7 @@ router.post('/', async (req, res) => {
 
     return res.status(201).json(product);
   } catch (err) {
+    if (err instanceof HttpError) return res.status(err.status).json({ error: err.message, code: err.code });
     console.error('Create product error:', err);
     return res.status(500).json({ error: 'Failed to create product' });
   }

@@ -53,7 +53,23 @@ router.get('/', async (req, res) => {
       prisma.supplier.count({ where }),
     ]);
 
-    return res.json({ suppliers, total, page, limit });
+    // Live payable (credit - debit) in the current financial year chain, like the customer list
+    const activeFy = await getActiveFY(prisma, businessId);
+    const ids = suppliers.map((s) => s.id);
+    const totals = activeFy && ids.length
+      ? await prisma.supplierLedgerEntry.groupBy({
+          by: ['supplier_id'],
+          where: { business_id: businessId, financial_year_id: activeFy.id, supplier_id: { in: ids } },
+          _sum: { debit: true, credit: true },
+        })
+      : [];
+    const balanceMap = Object.fromEntries(totals.map((t) => [t.supplier_id, (t._sum.credit || 0) - (t._sum.debit || 0)]));
+    const enriched = suppliers.map((s) => {
+      const balance = balanceMap[s.id] || 0;
+      return { ...s, balance, payable: Math.max(0, balance) };
+    });
+
+    return res.json({ suppliers: enriched, total, page, limit });
   } catch (err) {
     console.error('List suppliers error:', err);
     return res.status(500).json({ error: 'Failed to fetch suppliers' });

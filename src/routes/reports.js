@@ -9,6 +9,27 @@ const { dateRange, invoiceDateWhere, ymd, gstLines, sumBy } = require('../utils/
 router.use(authenticateToken);
 router.use(attachFinancialYear);
 
+// Malformed date / number query parameters are a client error, not a server crash
+const DATE_PARAM = /^d{4}-d{2}-d{2}$/;
+router.use((req, res, next) => {
+  for (const k of ['from', 'to', 'date', 'asOf']) {
+    const v = req.query[k];
+    if (v === undefined || v === '') continue;
+    const d = new Date(`${v}T00:00:00Z`);
+    if (typeof v !== 'string' || !DATE_PARAM.test(v) || Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== v) {
+      return res.status(400).json({ error: `Invalid ${k}: use YYYY-MM-DD`, code: 'VALIDATION' });
+    }
+  }
+  if (req.query.from && req.query.to && req.query.from > req.query.to) {
+    return res.status(400).json({ error: '"from" must not be after "to"', code: 'VALIDATION' });
+  }
+  if (req.query.threshold !== undefined) {
+    const t = Number(req.query.threshold);
+    if (!Number.isFinite(t) || t < 0) return res.status(400).json({ error: 'threshold must be a number >= 0', code: 'VALIDATION' });
+  }
+  next();
+});
+
 const istTime = (d) => new Date(new Date(d).getTime() + 5.5 * 3600 * 1000).toISOString().slice(11, 16);
 
 // Builds the invoice_date filter; defaults to FY boundaries. Calendar-date based (see utils/time.js).

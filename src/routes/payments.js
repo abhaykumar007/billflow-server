@@ -14,11 +14,11 @@ const {
 
 router.use(authenticateToken);
 
-const MODE_RE = /^[a-z_]{2,20}$/;
+const PAYMENT_MODES = ['cash', 'upi', 'card', 'cheque', 'bank', 'credit', 'other'];
 
 function parseMode(mode) {
   const m = String(mode || 'cash').trim().toLowerCase();
-  if (!MODE_RE.test(m)) throw new HttpError(400, 'Invalid payment_mode', 'VALIDATION');
+  if (!PAYMENT_MODES.includes(m)) throw new HttpError(400, `Invalid payment_mode (use one of: ${PAYMENT_MODES.join(', ')})`, 'VALIDATION');
   return m;
 }
 

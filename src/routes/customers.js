@@ -112,7 +112,9 @@ router.get('/:id', async (req, res) => {
           customer_id: customer.id,
           business_id: businessId,
           is_deleted: false,
-          status: { not: 'cancelled' },
+          // real sales only: estimates and drafts are not billed amounts
+          voucher_type: 'SALE',
+          status: { notIn: ['cancelled', 'draft'] },
         },
         _sum: { total_amount: true, amount_paid: true, balance_due: true },
         _count: { id: true },

@@ -10,7 +10,6 @@ const { assertFyWritable, assertDateInFY, assertRecordFyWritable } = require('..
 
 router.use(authenticateToken);
 
-const MODE_RE = /^[a-z_]{2,20}$/;
 
 async function resolveBankAccount(client, businessId, id) {
   if (!id) return null;
@@ -24,7 +23,7 @@ async function resolveBankAccount(client, businessId, id) {
 
 function parseMode(mode, fallback = 'cash') {
   const m = String(mode || fallback).trim().toLowerCase();
-  if (!MODE_RE.test(m)) throw new HttpError(400, 'Invalid payment_mode', 'VALIDATION');
+  if (!['cash', 'upi', 'card', 'cheque', 'bank', 'credit', 'other'].includes(m)) throw new HttpError(400, 'Invalid payment_mode', 'VALIDATION');
   return m;
 }
 
