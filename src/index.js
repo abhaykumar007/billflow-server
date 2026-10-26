@@ -96,6 +96,12 @@ module.exports = app;
 
 if (require.main === module) {
   const PORT = process.env.PORT || 5000;
+  // A missing JWT_SECRET must not take the whole service down. Fall back to a secret derived from the
+  // (private) database URL so the server can start; set JWT_SECRET explicitly to replace it.
+  if (!process.env.JWT_SECRET && process.env.DATABASE_URL) {
+    process.env.JWT_SECRET = require('crypto').createHash('sha256').update('billflow-jwt-v1:' + process.env.DATABASE_URL).digest('hex');
+    console.warn('JWT_SECRET is not set: using a secret derived from DATABASE_URL. Set JWT_SECRET in the environment.');
+  }
   const required = ['DATABASE_URL', 'JWT_SECRET'];
   const missing = required.filter((k) => !process.env[k]);
   if (missing.length) {
