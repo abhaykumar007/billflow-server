@@ -62,6 +62,7 @@ router.get('/', async (req, res) => {
       where: {
         business_id: businessId,
         customer_id: { in: customerIds },
+        voucher_type: 'SALE', // returns reduce what is owed (ledger); they are not receivables
         status: { in: ['sent', 'partial'] },
         is_deleted: false,
       },
