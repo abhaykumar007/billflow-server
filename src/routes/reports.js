@@ -10,7 +10,7 @@ router.use(authenticateToken);
 router.use(attachFinancialYear);
 
 // Malformed date / number query parameters are a client error, not a server crash
-const DATE_PARAM = /^d{4}-d{2}-d{2}$/;
+const DATE_PARAM = /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/;
 router.use((req, res, next) => {
   for (const k of ['from', 'to', 'date', 'asOf']) {
     const v = req.query[k];
