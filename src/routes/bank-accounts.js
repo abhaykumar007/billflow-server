@@ -30,6 +30,12 @@ router.post('/', requireRole(...MANAGERS), async (req, res) => {
   if (ifsc && !/^[A-Z]{4}0[A-Z0-9]{6}$/.test(ifsc)) throw new HttpError(400, 'Enter a valid IFSC code', 'VALIDATION');
   const openingPaise = rupeesToPaise(opening_balance, 'opening balance');
 
+  const dup = await prisma.bankAccount.findFirst({
+    where: { business_id: businessId, is_deleted: false, account_name: { equals: account_name.trim(), mode: 'insensitive' } },
+    select: { id: true },
+  });
+  if (dup) throw new HttpError(409, 'A bank account with this name already exists', 'DUPLICATE');
+
   const account = await prisma.bankAccount.create({
     data: {
       business_id: businessId,
