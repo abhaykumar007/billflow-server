@@ -47,6 +47,11 @@ model Business {
   phone                 String?
   email                 String?
   logo_url              String?
+  // Bill design: options (not free-form HTML) plus the small images the bill can show
+  bill_design           Json?
+  logo_data             String?
+  signature_data        String?
+  upi_id                String?
   currency              String                @default("INR")
   financial_year_start  Int                   @default(4)
   invoice_prefix        String                @default("INV")

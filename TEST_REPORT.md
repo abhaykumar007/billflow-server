@@ -30,3 +30,17 @@ Day-book 500; supplier list had no live payable; customer summary and list count
 - Render environment: `DATABASE_URL`, `DIRECT_URL`, `JWT_SECRET`, `CLIENT_URL`, Razorpay keys and `RAZORPAY_WEBHOOK_SECRET`; optional `SMTP_*`/`MAIL_FROM` for password-reset email (without them the reset link is not delivered). `JWT_REFRESH_SECRET` is no longer used.
 - Amounts: invoices and payments use paise in request bodies; products, customers, suppliers, expenses, bank accounts and transfers use rupees.
 - Login limit: 10 failed attempts per 15 minutes per address; sign-ups 10 per hour per address.
+
+## Bill design (customizable bills)
+
+What was added: a saved design per business (layout, colour, font, paper A4/A5/receipt 58 and 80 mm, header/customer/column toggles, wording, bank block, UPI QR, signature, footer), one server-side bill renderer used by web and phone, and endpoints `GET/PUT /api/bill-design`, `PUT /api/bill-design/assets` (logo, signature, UPI id), `POST /api/bill-design/preview`, `GET /api/invoices/:id/print`. One additive migration (`bill_design`, `logo_data`, `signature_data`, `upi_id` on Business; nothing existing changes).
+
+Safety rules enforced on the server: the design is options only (unknown keys dropped, bad values fall back to defaults, colours/fonts/sizes from allow-lists, text length-limited and always HTML-escaped); images must be PNG/JPEG/WebP data URLs under about 300 KB (SVG is refused); a GST-registered business cannot switch off business name, address, GSTIN, customer GSTIN, GST % column or the tax split; only the owner or an accountant can change anything; every read and print is scoped to the signed-in business.
+
+| Check | Result |
+|---|---|
+| Unit tests (`npm test`) | 40 pass (21 new: amount in words, design cleaning and GST locks, escaping of user text, image/UPI validation, columns/labels/layout, CGST+SGST vs IGST, PAID stamp, QR only on unpaid sales, bank block, all four paper sizes, 150-line bill, routes and role limits) |
+| `scripts/bill-design-suite.mjs` against a live server | 60 pass: sign-in required, two accounts cannot see or print each other's design/invoices, script text in labels printed as plain text, wrong-typed and array/`__proto__`/3000-deep JSON bodies, 2 MB bodies (413), bad logos (SVG, HTML, remote URL, script tricks, oversize), 13 bad UPI ids, junk `paper` values, 30 parallel previews, 120-line bill |
+| Existing API suite (`UPGRADE=1`, local Pro plan) | 133 of 133 still pass |
+
+Found and fixed while testing: a design sent as an array silently reset the design (now 400); standard wording was being stored in the database and my local test database (a Windows text encoding) could not store the ₹ sign, so only wording the user changed is stored now (standard words also update for everyone who never customized them). Note: the local test database cannot store non-Latin text (for example Hindi labels); production's database is UTF-8 and is not affected, but that is only confirmed once deployed.
