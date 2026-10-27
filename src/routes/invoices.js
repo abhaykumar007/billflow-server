@@ -7,6 +7,8 @@ const { attachFinancialYear, requireUnlockedFY, enforceOpenYear } = require('../
 const { HttpError } = require('../utils/httpError');
 const { lockRow, lockRows } = require('../utils/lock');
 const { computeInvoiceTotals } = require('../utils/money');
+const { effectiveDesign, PAPERS } = require('../services/billDesign');
+const { renderBill } = require('../services/billRenderer');
 const { parseDayStart, parseDayEnd, isValidDate, todayDate } = require('../utils/time');
 const {
   postCustomerEntry, postSupplierEntry, VOUCHERS,
@@ -372,6 +374,44 @@ router.get('/:id', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to fetch invoice' });
+  }
+});
+
+// ── GET /api/invoices/:id/print?paper=a4|a5|t80|t58 ───────────────────────────
+// The printable page for this bill, built from the business's saved bill design.
+router.get('/:id/print', async (req, res) => {
+  try {
+    const businessId = req.user.businessId;
+    const [invoice, business] = await Promise.all([
+      prisma.invoice.findFirst({
+        where: { id: req.params.id, business_id: businessId, is_deleted: false },
+        include: {
+          customer: true,
+          supplier: true,
+          items: { include: { product: { select: { id: true, name: true, unit: true, hsn_code: true } } }, orderBy: { created_at: 'asc' } },
+          payments: { where: { is_reversed: false }, orderBy: { payment_date: 'desc' } },
+          linked_invoice: { select: { id: true, invoice_number: true, voucher_type: true, invoice_date: true } },
+        },
+      }),
+      prisma.business.findUnique({ where: { id: businessId } }),
+    ]);
+    if (!invoice || !business) return res.status(404).json({ error: 'Invoice not found' });
+    const design = effectiveDesign(business.bill_design, business);
+    // "thermal" means the receipt width the business chose (58 or 80 mm), 80 mm if it chose a page size
+    const paper = req.query.paper === 'thermal'
+      ? (['t80', 't58'].includes(design.paper) ? design.paper : 't80')
+      : (PAPERS.includes(req.query.paper) ? req.query.paper : design.paper);
+    let bank = null;
+    if (design.extras.bank) {
+      const where = { business_id: businessId, is_deleted: false, is_active: true };
+      if (design.extras.bank_account_id) where.id = design.extras.bank_account_id;
+      bank = await prisma.bankAccount.findFirst({ where, orderBy: { created_at: 'asc' } });
+    }
+    const html = await renderBill({ invoice, business, design, paper, bank });
+    res.json({ html, paper, invoice_number: invoice.invoice_number });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to build the bill' });
   }
 });
 
