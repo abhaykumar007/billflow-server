@@ -201,6 +201,7 @@ test('routes: save is cleaned, assets validated, preview returns a page', async 
     assert.deepEqual(state.business.bill_design.labels, {}); // standard wording is not stored
     assert.equal(saved.design.labels.col_rate, 'Rate (₹)'); // but is still returned
     assert.equal((await fetch(`${base}/api/bill-design`, { method: 'PUT', headers: hdr(), body: JSON.stringify({}) })).status, 400);
+    assert.equal((await fetch(`${base}/api/bill-design`, { method: 'PUT', headers: hdr(), body: JSON.stringify({ design: [] }) })).status, 400);
     assert.equal((await fetch(`${base}/api/bill-design/assets`, { method: 'PUT', headers: hdr(), body: JSON.stringify({ logo_data: 'data:image/svg+xml;base64,PHN2Zz4=' }) })).status, 400);
     assert.equal((await fetch(`${base}/api/bill-design/assets`, { method: 'PUT', headers: hdr(), body: JSON.stringify({ upi_id: 'bad id' }) })).status, 400);
     assert.equal((await fetch(`${base}/api/bill-design/assets`, { method: 'PUT', headers: hdr(), body: JSON.stringify({}) })).status, 400);

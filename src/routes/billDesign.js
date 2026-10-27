@@ -56,7 +56,7 @@ router.put('/', requireRole(...MANAGERS), async (req, res) => {
   try {
     const business = await loadBusiness(req.user.businessId);
     if (!business) return res.status(404).json({ error: 'Business not found' });
-    if (!req.body || typeof req.body.design !== 'object' || req.body.design === null) return res.status(400).json({ error: 'design is required' });
+    if (!req.body || typeof req.body.design !== 'object' || req.body.design === null || Array.isArray(req.body.design)) return res.status(400).json({ error: 'design is required' });
     const design = sanitizeDesign(req.body.design, business);
     const updated = await prisma.business.update({ where: { id: business.id }, data: { bill_design: compactForStorage(design) } });
     return res.json(await payload(updated));
@@ -100,7 +100,7 @@ router.post('/preview', async (req, res) => {
     if (!business) return res.status(404).json({ error: 'Business not found' });
     const body = req.body || {};
     const paper = PAPERS.includes(body.paper) ? body.paper : undefined;
-    const design = sanitizeDesign(body.design && typeof body.design === 'object' ? body.design : business.bill_design || {}, business);
+    const design = sanitizeDesign(body.design && typeof body.design === 'object' && !Array.isArray(body.design) ? body.design : business.bill_design || {}, business);
     const html = await renderBill({ invoice: sampleInvoice(business), business, design, paper, bank: await bankFor(business.id, design) });
     return res.json({ html, paper: paper || design.paper });
   } catch (err) {
