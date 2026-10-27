@@ -124,10 +124,19 @@ function effectiveDesign(saved, business) {
   return sanitizeDesign(saved || {}, business);
 }
 
+// What is stored: the whole design, but labels only where the user changed the standard wording.
+function compactForStorage(design) {
+  const out = JSON.parse(JSON.stringify(design));
+  const custom = {};
+  for (const k of Object.keys(DEFAULT_LABELS)) if (out.labels[k] !== DEFAULT_LABELS[k]) custom[k] = out.labels[k];
+  out.labels = custom;
+  return out;
+}
+
 function validateUpi(v) { return typeof v === 'string' && UPI_RE.test(v.trim()); }
 function validateImage(v) { return typeof v === 'string' && v.length <= MAX_IMAGE_CHARS && IMAGE_RE.test(v); }
 
 module.exports = {
   DEFAULT_DESIGN, DEFAULT_LABELS, GST_LOCKED, LAYOUTS, FONTS, FONT_SIZES, PAPERS,
-  sanitizeDesign, effectiveDesign, enforceRequired, lockedPaths, validateUpi, validateImage, getPath, MAX_IMAGE_CHARS,
+  sanitizeDesign, compactForStorage, effectiveDesign, enforceRequired, lockedPaths, validateUpi, validateImage, getPath, MAX_IMAGE_CHARS,
 };

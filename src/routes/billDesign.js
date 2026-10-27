@@ -2,7 +2,7 @@ const express = require('express');
 const prisma = require('../utils/prisma');
 const { authenticateToken, requireRole, MANAGERS } = require('../middleware/auth');
 const {
-  effectiveDesign, sanitizeDesign, lockedPaths, validateImage, validateUpi, PAPERS,
+  effectiveDesign, sanitizeDesign, compactForStorage, lockedPaths, validateImage, validateUpi, PAPERS,
 } = require('../services/billDesign');
 const { renderBill, sampleInvoice } = require('../services/billRenderer');
 
@@ -46,6 +46,7 @@ router.get('/', async (req, res) => {
     if (!business) return res.status(404).json({ error: 'Business not found' });
     return res.json(await payload(business));
   } catch (err) {
+    console.error(err);
     return res.status(500).json({ error: 'Failed to load bill design' });
   }
 });
@@ -57,9 +58,10 @@ router.put('/', requireRole(...MANAGERS), async (req, res) => {
     if (!business) return res.status(404).json({ error: 'Business not found' });
     if (!req.body || typeof req.body.design !== 'object' || req.body.design === null) return res.status(400).json({ error: 'design is required' });
     const design = sanitizeDesign(req.body.design, business);
-    const updated = await prisma.business.update({ where: { id: business.id }, data: { bill_design: design } });
+    const updated = await prisma.business.update({ where: { id: business.id }, data: { bill_design: compactForStorage(design) } });
     return res.json(await payload(updated));
   } catch (err) {
+    console.error(err);
     return res.status(500).json({ error: 'Failed to save bill design' });
   }
 });
@@ -86,6 +88,7 @@ router.put('/assets', requireRole(...MANAGERS), async (req, res) => {
     const updated = await prisma.business.update({ where: { id: req.user.businessId }, data });
     return res.json(await payload(updated));
   } catch (err) {
+    console.error(err);
     return res.status(500).json({ error: 'Failed to save' });
   }
 });
@@ -101,6 +104,7 @@ router.post('/preview', async (req, res) => {
     const html = await renderBill({ invoice: sampleInvoice(business), business, design, paper, bank: await bankFor(business.id, design) });
     return res.json({ html, paper: paper || design.paper });
   } catch (err) {
+    console.error(err);
     return res.status(500).json({ error: 'Failed to build preview' });
   }
 });
