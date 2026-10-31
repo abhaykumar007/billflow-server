@@ -250,3 +250,13 @@ test('routes: paper=thermal uses the business thermal width, else 80 mm', async 
     });
   }
 });
+
+test('render: the page carries an image-only content rule and never links a remote logo', async () => {
+  const html = await renderBill({ invoice: sampleInvoice(biz()), business: biz({ logo_url: 'https://tracker.example/pixel.png' }) });
+  assert.ok(html.includes('http-equiv="Content-Security-Policy"'));
+  assert.ok(html.includes("default-src 'none'") && html.includes('img-src data:'));
+  assert.equal(html.includes('tracker.example'), false);
+  assert.equal(/src="https?:/i.test(html), false);
+  const withLogo = await renderBill({ invoice: sampleInvoice(biz()), business: biz({ logo_data: PNG, logo_url: 'https://tracker.example/pixel.png' }) });
+  assert.ok(withLogo.includes(PNG) && !withLogo.includes('tracker.example'));
+});

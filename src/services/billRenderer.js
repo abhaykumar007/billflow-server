@@ -254,7 +254,8 @@ async function renderBill({ invoice, business, design: rawDesign, paper, bank })
   const isReturn = type === 'SALE_RETURN' || type === 'PURCHASE_RETURN';
   const party = invoice.customer || invoice.supplier || null;
   const gType = gstType(party?.state, business.state, party?.gstin, business.gstin);
-  const logoSrc = validateImage(business.logo_data) ? business.logo_data : (/^https:\/\//i.test(business.logo_url || '') ? business.logo_url : '');
+  // Only uploaded images are shown. A remote logo link would make every viewer's device contact that host.
+  const logoSrc = validateImage(business.logo_data) ? business.logo_data : '';
   const signatureSrc = validateImage(business.signature_data) ? business.signature_data : '';
   const title = labels[TITLE_KEY[type]] || 'Invoice';
   const sellsToCustomer = type === 'SALE' || type === 'ESTIMATE';
@@ -282,7 +283,9 @@ async function renderBill({ invoice, business, design: rawDesign, paper, bank })
   };
   const stamp = design.extras.paid_stamp && type === 'SALE' && invoice.status === 'paid' ? '<div class="stamp">PAID</div>' : '';
   const body = spec.thermal ? renderThermal(ctx) : renderStandard(ctx);
-  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)} ${esc(invoice.invoice_number)}</title><style>${css(design, spec, design.accent)}</style></head><body><div class="page">${stamp}${body}</div></body></html>`;
+  // The page may only load inline images and styles: nothing from the network, no scripts, no frames.
+  const csp = "default-src 'none'; img-src data:; style-src 'unsafe-inline'";
+  return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${csp}"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)} ${esc(invoice.invoice_number)}</title><style>${css(design, spec, design.accent)}</style></head><body><div class="page">${stamp}${body}</div></body></html>`;
 }
 
 // A made-up bill for the live preview in settings (real business details, invented customer and items).
