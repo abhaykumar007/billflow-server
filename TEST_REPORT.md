@@ -44,3 +44,9 @@ Safety rules enforced on the server: the design is options only (unknown keys dr
 | Existing API suite (`UPGRADE=1`, local Pro plan) | 133 of 133 still pass |
 
 Found and fixed while testing: a design sent as an array silently reset the design (now 400); standard wording was being stored in the database and my local test database (a Windows text encoding) could not store the ₹ sign, so only wording the user changed is stored now (standard words also update for everyone who never customized them). Note: the local test database cannot store non-Latin text (for example Hindi labels); production's database is UTF-8 and is not affected, but that is only confirmed once deployed.
+
+### Bill text size (fixed 2026-11-01)
+
+Found: Small, Medium and Large changed A4/A5 text by only 1 px (11, 12, 13), invisible in the 65%-scaled editor preview, and receipts (80 and 58 mm) ignored the setting completely. Fixed: every size on the page scales by one factor (A4/A5: 0.88, 1, 1.2; receipts: 0.9, 1, 1.15). Tests: 42 pass; the new test checks body text, small text and headings all grow from Small to Large on A4, A5, 80 mm and 58 mm, Large is at least 25% bigger than Small, and an unknown value falls back to Medium. Looked at the largest A4 bill and the largest 58 mm receipt: nothing overflows.
+
+Also added a content rule to the bill page (`default-src 'none'; img-src data:; style-src 'unsafe-inline'`) and stopped loading remote logo links; checked in a browser that styles, logo, QR and bank details still draw and that a remote image and an injected script are blocked.

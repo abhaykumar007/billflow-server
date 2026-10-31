@@ -28,7 +28,8 @@ const FONT_STACK = {
   serif: "Georgia, 'Times New Roman', serif",
   mono: "'Courier New', Courier, monospace",
 };
-const SIZE_DELTA = { small: -1, medium: 0, large: 1 };
+const PAGE_SCALE = { small: 0.88, medium: 1, large: 1.2 };
+const THERMAL_SCALE = { small: 0.9, medium: 1, large: 1.15 }; // receipts are narrow, so a smaller range
 const LOGO_HEIGHT = { small: 32, medium: 48, large: 68 };
 const TITLE_KEY = { SALE: 'title_sale', PURCHASE: 'title_purchase', SALE_RETURN: 'title_sale_return', PURCHASE_RETURN: 'title_purchase_return', ESTIMATE: 'title_estimate' };
 
@@ -98,10 +99,11 @@ function cell(col, it, idx) {
 }
 
 function css(design, spec, accent) {
-  const delta = spec.thermal ? 0 : SIZE_DELTA[design.font_size] || 0;
-  const base = spec.base + delta;
+  // Text size scales every size on the page by the same factor, so the choice is easy to see (and works on receipts too).
+  const factor = (spec.thermal ? THERMAL_SCALE : PAGE_SCALE)[design.font_size] || 1;
+  const base = Math.round(spec.base * factor * 10) / 10;
   const layout = spec.thermal ? 'thermal' : design.layout;
-  const small = Math.max(base - 1.5, 8);
+  const small = Math.max(Math.round(base * 0.875 * 10) / 10, 7.5);
   const modern = layout === 'modern';
   const compact = layout === 'compact';
   return `

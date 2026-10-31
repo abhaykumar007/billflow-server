@@ -260,3 +260,22 @@ test('render: the page carries an image-only content rule and never links a remo
   const withLogo = await renderBill({ invoice: sampleInvoice(biz()), business: biz({ logo_data: PNG, logo_url: 'https://tracker.example/pixel.png' }) });
   assert.ok(withLogo.includes(PNG) && !withLogo.includes('tracker.example'));
 });
+
+test('render: text size visibly changes every size on A4, A5 and receipts', async () => {
+  const sizeOf = (html, re) => parseFloat(re.exec(html)[1]);
+  for (const paper of ['a4', 'a5', 't80', 't58']) {
+    const out = {};
+    for (const font_size of ['small', 'medium', 'large']) {
+      const html = await renderBill({ invoice: sampleInvoice(biz()), business: biz(), design: { font_size }, paper });
+      out[font_size] = { body: sizeOf(html, /body\{[^}]*font-size:([\d.]+)px/), small: sizeOf(html, /\.gray\{[^}]*font-size:([\d.]+)px/), name: sizeOf(html, /\.biz-name\{font-size:([\d.]+)px/) };
+    }
+    assert.ok(out.small.body < out.medium.body && out.medium.body < out.large.body, `${paper} body grows`);
+    assert.ok(out.small.small < out.medium.small && out.medium.small < out.large.small, `${paper} small text grows`);
+    assert.ok(out.small.name < out.medium.name && out.medium.name < out.large.name, `${paper} heading grows`);
+    assert.ok(out.large.body / out.small.body >= 1.25, `${paper} large is at least 25% bigger than small (${out.large.body}/${out.small.body})`);
+  }
+  const unknown = await renderBill({ invoice: sampleInvoice(biz()), business: biz(), design: { font_size: 'huge' } });
+  const medium = await renderBill({ invoice: sampleInvoice(biz()), business: biz(), design: { font_size: 'medium' } });
+  assert.equal(unknown.includes('body{font-family:Arial, Helvetica, sans-serif;font-size:12px'), true);
+  assert.equal(medium.includes('font-size:12px'), true);
+});
