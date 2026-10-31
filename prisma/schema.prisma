@@ -65,6 +65,8 @@ model Business {
   updated_at            DateTime              @updatedAt
   purchase_next_number  Int                   @default(1)
   purchase_prefix       String                @default("PUR")
+  barcode_next_number   Int                   @default(1)
+  productBarcodes       ProductBarcode[]
   bankAccounts          BankAccount[]
   customers             Customer[]
   expenses              Expense[]
@@ -244,10 +246,28 @@ model Product {
   created_at      DateTime         @default(now())
   updated_at      DateTime         @updatedAt
   invoiceItems    InvoiceItem[]
+  barcodes        ProductBarcode[]
   business        Business         @relation(fields: [business_id], references: [id])
   category        ProductCategory? @relation(fields: [category_id], references: [id])
 
   @@index([business_id, is_deleted])
+}
+
+// A scannable code for a product. An item can have several (for example two pack sizes); within one business a code
+// belongs to exactly one item, so a scan always means one thing. `own` codes are made by BillFlow (EAN-13 starting with 2),
+// `manufacturer` codes are the ones printed on the pack.
+model ProductBarcode {
+  id          String   @id @default(cuid())
+  business_id String
+  product_id  String
+  code        String
+  kind        String   @default("manufacturer")
+  created_at  DateTime @default(now())
+  business    Business @relation(fields: [business_id], references: [id])
+  product     Product  @relation(fields: [product_id], references: [id], onDelete: Cascade)
+
+  @@unique([business_id, code])
+  @@index([product_id])
 }
 
 model Invoice {

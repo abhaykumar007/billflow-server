@@ -5,8 +5,11 @@ const { authenticateToken, requireRole, MANAGERS } = require('../middleware/auth
 const { HttpError } = require('../utils/httpError');
 const { rupeesToPaise, pageParams } = require('../utils/validate');
 const { lockRow } = require('../utils/lock');
+const { normalizeCode, codeProblem } = require('../utils/barcode');
 
-const num = (v, field, { min = 0, max = 1e9 } = {}) => {
+const WITH_BARCODES = { select: { id: true, code: true, kind: true }, orderBy: { created_at: 'asc' } };
+
+const num =(v, field, { min = 0, max = 1e9 } = {}) => {
   const n = Number(v);
   if (!Number.isFinite(n) || n < min || n > max) throw new HttpError(400, `Invalid ${field}`, 'VALIDATION');
   return n;
@@ -65,6 +68,8 @@ router.get('/', async (req, res) => {
               { name: { contains: search, mode: 'insensitive' } },
               { description: { contains: search, mode: 'insensitive' } },
               { hsn_code: { contains: search, mode: 'insensitive' } },
+              // typing or scanning a barcode finds the item too
+              ...(normalizeCode(search) ? [{ barcodes: { some: { code: { contains: normalizeCode(search) } } } }] : []),
             ],
           }
         : {}),
@@ -76,7 +81,7 @@ router.get('/', async (req, res) => {
         orderBy: { name: 'asc' },
         skip,
         take: limit,
-        include: { category: { select: { id: true, name: true, color: true } } },
+        include: { category: { select: { id: true, name: true, color: true } }, barcodes: WITH_BARCODES },
       }),
       prisma.product.count({ where }),
     ]);
@@ -94,7 +99,7 @@ router.get('/:id', async (req, res) => {
     const businessId = req.user.businessId;
     const product = await prisma.product.findFirst({
       where: { id: req.params.id, business_id: businessId, is_deleted: false },
-      include: { category: { select: { id: true, name: true, color: true } } },
+      include: { category: { select: { id: true, name: true, color: true } }, barcodes: WITH_BARCODES },
     });
     if (!product) return res.status(404).json({ error: 'Product not found' });
     return res.json(product);
@@ -129,6 +134,17 @@ router.post('/', async (req, res) => {
     });
     if (duplicate) return res.status(409).json({ error: `A product named "${duplicate.name}" already exists` });
 
+    // optional: create the item together with the barcode that was just scanned
+    let barcode = null;
+    if (req.body.barcode !== undefined && req.body.barcode !== null && req.body.barcode !== '') {
+      barcode = normalizeCode(req.body.barcode);
+      const problem = codeProblem(barcode);
+      if (problem) throw new HttpError(400, problem, 'VALIDATION');
+      const taken = await prisma.productBarcode.findFirst({ where: { business_id: businessId, code: barcode }, include: { product: { select: { name: true, is_deleted: true } } } });
+      if (taken && !taken.product.is_deleted) throw new HttpError(409, `This barcode is already used by "${taken.product.name}"`, 'BARCODE_IN_USE');
+      if (taken) await prisma.productBarcode.delete({ where: { id: taken.id } });
+    }
+
     const product = await prisma.product.create({
       data: {
         business_id: businessId,
@@ -143,13 +159,15 @@ router.post('/', async (req, res) => {
         stock_quantity: track_inventory ? num(stock_quantity, 'stock quantity', { min: -1e9 }) : 0,
         low_stock_alert: Math.max(parseInt(low_stock_alert) || 0, 0),
         category_id: await assertCategory(prisma, businessId, category_id),
+        ...(barcode ? { barcodes: { create: [{ business_id: businessId, code: barcode, kind: 'manufacturer' }] } } : {}),
       },
-      include: { category: { select: { id: true, name: true, color: true } } },
+      include: { category: { select: { id: true, name: true, color: true } }, barcodes: WITH_BARCODES },
     });
 
     return res.status(201).json(product);
   } catch (err) {
     if (err instanceof HttpError) return res.status(err.status).json({ error: err.message, code: err.code });
+    if (err && err.code === 'P2002') return res.status(409).json({ error: 'This barcode is already used by another item', code: 'BARCODE_IN_USE' });
     console.error('Create product error:', err);
     return res.status(500).json({ error: 'Failed to create product' });
   }
@@ -210,7 +228,7 @@ router.put('/:id', async (req, res) => {
           ...(is_active !== undefined && { is_active: Boolean(is_active) }),
           ...(categoryId !== undefined && { category_id: categoryId }),
         },
-        include: { category: { select: { id: true, name: true, color: true } } },
+        include: { category: { select: { id: true, name: true, color: true } }, barcodes: WITH_BARCODES },
       });
     });
     if (stock_quantity !== undefined && Number(stock_quantity) !== existing.stock_quantity) {
@@ -219,6 +237,7 @@ router.put('/:id', async (req, res) => {
 
     return res.json(updated);
   } catch (err) {
+    if (err instanceof HttpError) return res.status(err.status).json({ error: err.message, code: err.code });
     console.error('Update product error:', err);
     return res.status(500).json({ error: 'Failed to update product' });
   }
@@ -237,6 +256,8 @@ router.delete('/:id', requireRole(...MANAGERS), async (req, res) => {
       where: { id: req.params.id },
       data: { is_deleted: true },
     });
+    // a deleted item gives its barcodes back, so the numbers can be used again
+    await prisma.productBarcode.deleteMany({ where: { product_id: req.params.id } });
 
     return res.json({ success: true });
   } catch (err) {

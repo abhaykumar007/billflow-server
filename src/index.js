@@ -15,6 +15,7 @@ const dashboardRoutes = require('./routes/dashboard');
 const customersRoutes = require('./routes/customers');
 const suppliersRoutes = require('./routes/suppliers');
 const productsRoutes = require('./routes/products');
+const productBarcodeRoutes = require('./routes/productBarcodes');
 const productCategoriesRoutes = require('./routes/product-categories');
 const invoicesRoutes = require('./routes/invoices');
 const paymentsRoutes = require('./routes/payments');
@@ -62,6 +63,8 @@ app.use('/api/bill-design', billDesignRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/customers', customersRoutes);
 app.use('/api/suppliers', suppliersRoutes);
+// barcode routes first, so /by-barcode/:code and /labels are not read as a product id
+app.use('/api/products', productBarcodeRoutes);
 app.use('/api/products', productsRoutes);
 app.use('/api/product-categories', productCategoriesRoutes);
 app.use('/api/invoices', invoicesRoutes);
