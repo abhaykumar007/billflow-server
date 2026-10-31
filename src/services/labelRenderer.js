@@ -9,7 +9,9 @@ const inr = (paise) => new Intl.NumberFormat('en-IN', { style: 'currency', curre
 
 // Sizes are in millimetres. Sheets are laid out edge to edge from the top left, like common sticker sheets.
 const LAYOUTS = {
-  'a4-24': { label: 'A4 sheet, 24 labels (70 x 37 mm)', sheet: { cols: 3, rows: 8, w: 70, h: 37, padX: 0, padY: 0.5 }, name: 9, code: 7.5, price: 10 },
+  // Edge-to-edge sticker sheets put the outer columns right at the paper edge, where most printers cannot print (about 3 to 6 mm
+  // is left blank). A wide side padding keeps the bars inside the printable area.
+  'a4-24': { label: 'A4 sheet, 24 labels (70 x 37 mm)', sheet: { cols: 3, rows: 8, w: 70, h: 37, padX: 0, padY: 0.5 }, pad: '1.2mm 7mm', name: 9, code: 7.5, price: 10 },
   'a4-65': { label: 'A4 sheet, 65 labels (38 x 21 mm)', sheet: { cols: 5, rows: 13, w: 38.1, h: 21.2, padX: 9.75, padY: 10.7 }, name: 6.5, code: 5.5, price: 7 },
   'thermal-50x25': { label: 'Thermal label 50 x 25 mm', single: { w: 50, h: 25 }, name: 8, code: 7, price: 9 },
   'thermal-38x25': { label: 'Thermal label 38 x 25 mm', single: { w: 38, h: 25 }, name: 7, code: 6, price: 8 },
@@ -45,7 +47,7 @@ html,body{margin:0;padding:0;background:#fff;font-family:Arial,Helvetica,sans-se
 ${spec.sheet
     ? `.sheet{width:210mm;height:297mm;padding:${spec.sheet.padY}mm ${spec.sheet.padX}mm;display:grid;grid-template-columns:repeat(${spec.sheet.cols},${spec.sheet.w}mm);grid-auto-rows:${spec.sheet.h}mm;page-break-after:always;overflow:hidden}`
     : ''}
-.lbl{width:${cell.w}mm;height:${cell.h}mm;padding:1.2mm 1.8mm;display:flex;flex-direction:column;justify-content:space-between;overflow:hidden;${spec.single ? 'page-break-after:always;' : ''}}
+.lbl{width:${cell.w}mm;height:${cell.h}mm;padding:${spec.pad || '1.2mm 1.8mm'};display:flex;flex-direction:column;justify-content:space-between;overflow:hidden;${spec.single ? 'page-break-after:always;' : ''}}
 .n{font-size:${spec.name}pt;font-weight:bold;line-height:1.1;max-height:2.2em;overflow:hidden}
 .bars{flex:1 1 auto;min-height:0;width:100%}
 .r{display:flex;justify-content:space-between;align-items:baseline;gap:2mm}
