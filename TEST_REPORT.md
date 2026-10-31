@@ -50,3 +50,13 @@ Found and fixed while testing: a design sent as an array silently reset the desi
 Found: Small, Medium and Large changed A4/A5 text by only 1 px (11, 12, 13), invisible in the 65%-scaled editor preview, and receipts (80 and 58 mm) ignored the setting completely. Fixed: every size on the page scales by one factor (A4/A5: 0.88, 1, 1.2; receipts: 0.9, 1, 1.15). Tests: 42 pass; the new test checks body text, small text and headings all grow from Small to Large on A4, A5, 80 mm and 58 mm, Large is at least 25% bigger than Small, and an unknown value falls back to Medium. Looked at the largest A4 bill and the largest 58 mm receipt: nothing overflows.
 
 Also added a content rule to the bill page (`default-src 'none'; img-src data:; style-src 'unsafe-inline'`) and stopped loading remote logo links; checked in a browser that styles, logo, QR and bank details still draw and that a remote image and an injected script are blocked.
+
+## Barcodes (added 2026-11-01)
+
+New tables/columns (additive migration `20261101000000_product_barcodes`): `ProductBarcode` (code unique per business, kind `own`/`manufacturer`, deleted with its item), `Business.barcode_next_number`. Endpoints under `/api/products`: `GET /by-barcode/:code`, `GET /label-layouts`, `POST /labels`, `GET|POST /:id/barcodes`, `POST /:id/barcodes/generate`, `DELETE /:id/barcodes/:barcodeId`; `POST /products` accepts an optional `barcode`; list search also matches barcodes.
+
+- Own codes are EAN-13 starting with `2` (GS1 reserves 20–29 for in-store use) with a valid check digit, from a per-business counter moved forward inside the same transaction.
+- Scanner input is cleaned (spaces, line breaks, case). Junk (`<script>`, quotes, too short/long) is refused. A code of a standard length with a wrong check digit is accepted with a warning.
+- A code belongs to one live item per business; another business may use the same number; a deleted item gives its codes back. At most 10 codes per item; labels: 1–100 items, 1–100 copies, 500 labels per request.
+- The label page is escaped, carries a content rule (no scripts, no network) and draws bars with `bwip-js`.
+- Tests: 12 new unit/route tests (`test/barcodes.test.js`), suite now 54/54. Break-it script `scripts/barcode-suite.mjs`: 53/53 locally (access control, tenant isolation, duplicates, junk input, limits, label caps, deleted items). Old suites unchanged: `api-suite` all checks pass (`UPGRADE=1`), `bill-design-suite` 60/60.
