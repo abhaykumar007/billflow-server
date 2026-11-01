@@ -17,7 +17,7 @@ async function account(label, gstin) {
 }
 async function invoiceFor(token, label) {
   const c = await call('POST', '/customers', token, { name: `Customer ${label}`, state: 'Karnataka' });
-  const i = await call('POST', '/invoices', token, { voucher_type: 'SALE', status: 'sent', customer_id: c.json.id, invoice_date: new Date().toISOString().slice(0, 10), items: [{ description: `Item for ${label}`, quantity: 2, unit: 'pcs', rate: 100000, discount_percent: 0, tax_rate: 18 }], discount_amount: 0 }, { 'idempotency-key': `bd-${label}-${stamp}` });
+  const i = await call('POST', '/invoices', token, { voucher_type: 'SALE', status: 'sent', customer_id: c.json.id, invoice_date: new Date(Date.now() + 5.5 * 36e5).toISOString().slice(0, 10), items: [{ description: `Item for ${label}`, quantity: 2, unit: 'pcs', rate: 100000, discount_percent: 0, tax_rate: 18 }], discount_amount: 0 }, { 'idempotency-key': `bd-${label}-${stamp}` });
   return i.json;
 }
 const PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
@@ -117,7 +117,7 @@ const PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJA
   // long bill
   const items = Array.from({ length: 120 }, (_, i) => ({ description: `Bulk line ${i + 1}`, quantity: 1, unit: 'pcs', rate: 1000 + i, discount_percent: 0, tax_rate: 12 }));
   const cust = await call('POST', '/customers', A, { name: 'Bulk Buyer', state: 'Karnataka' });
-  const bulk = await call('POST', '/invoices', A, { voucher_type: 'SALE', status: 'sent', customer_id: cust.json.id, invoice_date: new Date().toISOString().slice(0, 10), items, discount_amount: 0 }, { 'idempotency-key': `bulk-${stamp}` });
+  const bulk = await call('POST', '/invoices', A, { voucher_type: 'SALE', status: 'sent', customer_id: cust.json.id, invoice_date: new Date(Date.now() + 5.5 * 36e5).toISOString().slice(0, 10), items, discount_amount: 0 }, { 'idempotency-key': `bulk-${stamp}` });
   const bulkPrint = bulk.json.id ? await call('GET', `/invoices/${bulk.json.id}/print`, A) : { status: 0, json: { html: '' } };
   check('a 120-line bill prints every line', bulkPrint.status === 200 && (bulkPrint.json.html.match(/Bulk line \d+/g) || []).length === 120, `${bulk.status} ${bulkPrint.status}`);
 

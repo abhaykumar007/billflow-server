@@ -10,6 +10,7 @@ router.post('/register', registerLimiter, register);
 router.post('/login', loginLimiter, login);
 router.post('/refresh', refreshLimiter, refresh);
 router.post('/logout', logout);
+router.put('/password', authenticateToken, require('./settings').changePassword);
 router.post('/logout-all', authenticateToken, logoutAll);
 router.post('/forgot-password', passwordResetLimiter, forgotPassword);
 router.post('/reset-password', passwordResetLimiter, resetPassword);

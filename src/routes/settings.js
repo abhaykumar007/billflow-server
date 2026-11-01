@@ -363,8 +363,9 @@ router.delete('/users/:id', requireRole('owner'), async (req, res) => {
   }
 });
 
-// PUT /api/settings/password — change own password
-router.put('/password', async (req, res) => {
+// PUT /api/settings/password (the phone) and PUT /api/auth/password (the web) — change own password.
+// The web's refresh cookie is only sent to /api/auth/*, so it uses the second path: that is how the server knows which session to keep.
+const changePassword = async (req, res) => {
   try {
     const { current_password, new_password } = req.body;
     if (!current_password || !new_password) {
@@ -395,6 +396,8 @@ router.put('/password', async (req, res) => {
     console.error('Password change error:', err);
     return res.status(500).json({ error: 'Failed to change password' });
   }
-});
+};
+router.put('/password', changePassword);
+router.changePassword = changePassword;
 
 module.exports = router;

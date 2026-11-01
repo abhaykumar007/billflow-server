@@ -6,7 +6,8 @@ const stamp = Date.now();
 let pass = 0; let fail = 0; let n = 0;
 const check = (name, ok, extra = '') => { (ok ? pass++ : fail++); console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${ok ? '' : `  ${extra}`}`); };
 const nm = (p) => `${p} ${stamp}-${++n}`;
-const day = (offset) => new Date(Date.now() + offset * 864e5).toISOString().slice(0, 10);
+// business days are IST (the server counts them that way), not UTC
+const day = (offset) => new Date(Date.now() + 5.5 * 36e5 + offset * 864e5).toISOString().slice(0, 10);
 
 async function call(method, path, token, body, headers = {}) {
   const res = await fetch(`${API}${path}`, { method, headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}), ...headers }, body: body === undefined ? undefined : JSON.stringify(body) });
