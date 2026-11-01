@@ -7,6 +7,27 @@ const { rupeesToPaise, pageParams } = require('../utils/validate');
 const { lockRow } = require('../utils/lock');
 const { normalizeCode, codeProblem } = require('../utils/barcode');
 
+// Medical / FMCG fields. Money in rupees here, like the other product fields (the response is in paise).
+const SCHEDULES = ['H', 'H1', 'X', 'NARCOTIC', 'OTC'];
+function medFields(body) {
+  const out = {};
+  if ('mrp' in body) out.mrp = rupeesToPaise(body.mrp ?? 0, 'MRP');
+  if ('track_batches' in body) out.track_batches = Boolean(body.track_batches);
+  const text = (k, max) => { if (k in body) out[k] = body[k] == null || String(body[k]).trim() === '' ? null : String(body[k]).trim().slice(0, max); };
+  text('pack_size', 40); text('manufacturer', 100); text('composition', 300);
+  if ('schedule' in body) {
+    const v = body.schedule == null || body.schedule === '' ? null : String(body.schedule).trim().toUpperCase();
+    if (v && !SCHEDULES.includes(v)) throw new HttpError(400, `Schedule must be one of ${SCHEDULES.join(', ')}`, 'VALIDATION');
+    out.schedule = v;
+  }
+  return out;
+}
+// The stock an item already has becomes its first batch when batch tracking is switched on.
+const openingBatch = (business_id, product) => ({
+  business_id, product_id: product.id, batch_no: 'OPENING', mrp: product.mrp || product.sale_price || 0, purchase_price: product.purchase_price || 0,
+  quantity: product.stock_quantity, is_opening: true,
+});
+
 const WITH_BARCODES = { select: { id: true, code: true, kind: true }, orderBy: { created_at: 'asc' } };
 
 const num =(v, field, { min = 0, max = 1e9 } = {}) => {
@@ -126,6 +147,7 @@ router.post('/', async (req, res) => {
       low_stock_alert = 10,
       category_id,
     } = req.body;
+    const med = medFields(req.body);
 
     if (!name || !name.trim()) return res.status(400).json({ error: 'Product name is required' });
 
@@ -155,8 +177,9 @@ router.post('/', async (req, res) => {
         purchase_price: rupeesToPaise(purchase_price, 'purchase price'),
         tax_rate: num(tax_rate, 'GST %', { max: 100 }),
         hsn_code: hsn_code?.trim() || null,
-        track_inventory: Boolean(track_inventory),
-        stock_quantity: track_inventory ? num(stock_quantity, 'stock quantity', { min: -1e9 }) : 0,
+        ...med,
+        track_inventory: Boolean(track_inventory) || med.track_batches === true, // batches need stock tracking
+        stock_quantity: (track_inventory || med.track_batches) ? num(stock_quantity, 'stock quantity', { min: -1e9 }) : 0,
         low_stock_alert: Math.max(parseInt(low_stock_alert) || 0, 0),
         category_id: await assertCategory(prisma, businessId, category_id),
         ...(barcode ? { barcodes: { create: [{ business_id: businessId, code: barcode, kind: 'manufacturer' }] } } : {}),
@@ -164,6 +187,7 @@ router.post('/', async (req, res) => {
       include: { category: { select: { id: true, name: true, color: true } }, barcodes: WITH_BARCODES },
     });
 
+    if (product.track_batches && product.stock_quantity !== 0) await prisma.batch.create({ data: openingBatch(businessId, product) });
     return res.status(201).json(product);
   } catch (err) {
     if (err instanceof HttpError) return res.status(err.status).json({ error: err.message, code: err.code });
@@ -196,6 +220,7 @@ router.put('/:id', async (req, res) => {
       is_active,
       category_id,
     } = req.body;
+    const med = medFields(req.body);
 
     if (name !== undefined && !name.trim()) {
       return res.status(400).json({ error: 'Product name cannot be empty' });
@@ -210,9 +235,13 @@ router.put('/:id', async (req, res) => {
 
     const categoryId = 'category_id' in req.body ? await assertCategory(prisma, businessId, category_id) : undefined;
 
+    const turningOn = med.track_batches === true && !existing.track_batches;
     const updated = await prisma.$transaction(async (tx) => {
       await lockRow(tx, 'product', req.params.id); // serialise with invoices moving stock
-      return tx.product.update({
+      if (med.track_batches === false && existing.track_batches) {
+        throw new HttpError(400, 'Batch tracking cannot be turned off once it is on (it would lose the stock per batch)', 'VALIDATION');
+      }
+      const result = await tx.product.update({
         where: { id: req.params.id },
         data: {
           ...(name !== undefined && { name: name.trim().slice(0, 150) }),
@@ -227,9 +256,13 @@ router.put('/:id', async (req, res) => {
           ...(low_stock_alert !== undefined && { low_stock_alert: Math.max(parseInt(low_stock_alert) || 0, 0) }),
           ...(is_active !== undefined && { is_active: Boolean(is_active) }),
           ...(categoryId !== undefined && { category_id: categoryId }),
+          ...med,
+          ...(med.track_batches === true && { track_inventory: true }),
         },
         include: { category: { select: { id: true, name: true, color: true } }, barcodes: WITH_BARCODES },
       });
+      if (turningOn && result.stock_quantity !== 0) await tx.batch.create({ data: openingBatch(req.user.businessId, result) });
+      return result;
     });
     if (stock_quantity !== undefined && Number(stock_quantity) !== existing.stock_quantity) {
       console.info(`[audit] stock of product ${existing.id} set ${existing.stock_quantity} -> ${stock_quantity} by user ${req.user.userId}`);

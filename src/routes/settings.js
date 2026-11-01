@@ -46,6 +46,44 @@ router.put('/business', requireRole('owner'), async (req, res) => {
   }
 });
 
+// GET/PUT /api/settings/industry — what kind of business this is (shows medical / FMCG features), licence lines for bills,
+// whether rates include GST, and how early "near expiry" starts.
+const BUSINESS_TYPES = ['general', 'medical', 'fmcg'];
+const INDUSTRY_SELECT = { business_type: true, drug_license_20: true, drug_license_21: true, fssai_no: true, rates_include_gst: true, near_expiry_days: true };
+router.get('/industry', async (req, res) => {
+  try {
+    return res.json(await prisma.business.findUnique({ where: { id: req.user.businessId }, select: INDUSTRY_SELECT }));
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to load settings' });
+  }
+});
+router.put('/industry', requireRole('owner'), async (req, res) => {
+  try {
+    const b = req.body || {}; const data = {};
+    if ('business_type' in b) {
+      if (!BUSINESS_TYPES.includes(b.business_type)) return res.status(400).json({ error: `Business type must be one of ${BUSINESS_TYPES.join(', ')}` });
+      data.business_type = b.business_type;
+    }
+    const text = (k, max) => { if (k in b) data[k] = b[k] == null || String(b[k]).trim() === '' ? null : String(b[k]).trim().slice(0, max); };
+    text('drug_license_20', 40); text('drug_license_21', 40);
+    if ('fssai_no' in b) {
+      const v = b.fssai_no == null ? '' : String(b.fssai_no).replace(/\s+/g, '');
+      if (v && !/^\d{14}$/.test(v)) return res.status(400).json({ error: 'FSSAI number is 14 digits' });
+      data.fssai_no = v || null;
+    }
+    if ('rates_include_gst' in b) data.rates_include_gst = b.rates_include_gst === true;
+    if ('near_expiry_days' in b) {
+      const n = Number(b.near_expiry_days);
+      if (!Number.isInteger(n) || n < 1 || n > 730) return res.status(400).json({ error: 'Near-expiry days must be a whole number from 1 to 730' });
+      data.near_expiry_days = n;
+    }
+    return res.json(await prisma.business.update({ where: { id: req.user.businessId }, data, select: INDUSTRY_SELECT }));
+  } catch (err) {
+    console.error('Update industry settings error:', err);
+    return res.status(500).json({ error: 'Failed to save settings' });
+  }
+});
+
 // GET /api/settings/invoice
 router.get('/invoice', async (req, res) => {
   try {

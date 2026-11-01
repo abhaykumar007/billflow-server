@@ -7,6 +7,7 @@ const { attachFinancialYear, requireUnlockedFY, enforceOpenYear } = require('../
 const { HttpError } = require('../utils/httpError');
 const { lockRow, lockRows } = require('../utils/lock');
 const { computeInvoiceTotals } = require('../utils/money');
+const { adjustInventory, validateBatchLines, assertSaleBatchesSellable } = require('../services/stock');
 const { effectiveDesign, PAPERS } = require('../services/billDesign');
 const { renderBill } = require('../services/billRenderer');
 const { parseDayStart, parseDayEnd, isValidDate, todayDate } = require('../utils/time');
@@ -69,35 +70,6 @@ async function allocateInvoiceNumber(tx, voucherType, financialYear, businessId)
   return `${prefix}-${fyCode(financialYear)}-${String(seq).padStart(4, '0')}`;
 }
 
-// Stock movement. direction +1 = add, -1 = remove. Quantities are summed per product,
-// products are locked in a stable order, and every update is scoped to the business.
-// Returns warnings for products that went below zero (selling before receiving stock is
-// common in small shops, so this warns instead of blocking).
-async function adjustInventory(tx, businessId, items, direction) {
-  const perProduct = new Map();
-  for (const item of items) {
-    if (!item.product_id) continue;
-    perProduct.set(item.product_id, (perProduct.get(item.product_id) || 0) + Number(item.quantity));
-  }
-  if (perProduct.size === 0) return [];
-
-  await lockRows(tx, 'product', [...perProduct.keys()]);
-  const products = await tx.product.findMany({
-    where: { id: { in: [...perProduct.keys()] }, business_id: businessId },
-    select: { id: true, name: true, track_inventory: true, stock_quantity: true },
-  });
-
-  const warnings = [];
-  for (const product of products) {
-    if (!product.track_inventory) continue;
-    const delta = direction * perProduct.get(product.id);
-    const after = product.stock_quantity + delta;
-    await tx.product.update({ where: { id: product.id }, data: { stock_quantity: { increment: delta } } });
-    if (after < 0) warnings.push({ product_id: product.id, name: product.name, stock_after: after });
-  }
-  return warnings;
-}
-
 // Posts a finalised voucher to the party ledger and stock.
 async function postVoucher(tx, invoice, items, { fyId, entryDate }) {
   const v = VOUCHERS[invoice.voucher_type];
@@ -109,7 +81,8 @@ async function postVoucher(tx, invoice, items, { fyId, entryDate }) {
   };
   if (v.party === 'CUSTOMER') await postCustomerEntry(tx, { ...entry, customerId: invoice.customer_id });
   else await postSupplierEntry(tx, { ...entry, supplierId: invoice.supplier_id });
-  return adjustInventory(tx, invoice.business_id, items, v.stock);
+  if (invoice.voucher_type === 'SALE') await assertSaleBatchesSellable(tx, items);
+  return adjustInventory(tx, invoice.business_id, items, v.stock, { supplierId: invoice.supplier_id });
 }
 
 // Reverses a posted voucher (cancel): opposite ledger side, opposite stock movement.
@@ -435,7 +408,8 @@ router.post('/', attachFinancialYear, enforceOpenYear, requireUnlockedFY, checkI
 
   await assertCanPost(prisma, fy);
   const { invoiceDate, dueDate, validUntil } = parseDates(req.body, fy);
-  const totals = computeInvoiceTotals(items, discount_amount);   // server is the source of truth
+  const business = await prisma.business.findUnique({ where: { id: businessId }, select: { rates_include_gst: true, business_type: true } });
+  const totals = computeInvoiceTotals(items, discount_amount, { inclusive: business.rates_include_gst });   // server is the source of truth
   const key = idempotencyKey(req);
 
   if (key) {
@@ -448,12 +422,14 @@ router.post('/', attachFinancialYear, enforceOpenYear, requireUnlockedFY, checkI
 
   let creditWarning = null;
   let stockWarnings = [];
+  let mrpWarnings = [];
 
   const invoice = await prisma.$transaction(async (tx) => {
     const { customer, linked } = await validateReferences(tx, businessId, {
       voucher_type, customer_id, supplier_id, linked_invoice_id, lines: totals.lines,
     });
     await validateReturnQuantities(tx, businessId, voucher_type, linked, totals.lines, null);
+    mrpWarnings = await validateBatchLines(tx, { businessId, business, user: req.user, voucher_type, lines: totals.lines });
 
     // Credit limit (SALE only)
     if (voucher_type === 'SALE' && customer?.credit_limit > 0) {
@@ -489,6 +465,8 @@ router.post('/', attachFinancialYear, enforceOpenYear, requireUnlockedFY, checkI
         status,
         subtotal: totals.subtotal,
         discount_amount: totals.discount_amount,
+        discount_incl: totals.discount_incl,
+        rates_include_gst: business.rates_include_gst,
         tax_amount: totals.tax_amount,
         total_amount: totals.total_amount,
         amount_paid: 0,
@@ -511,6 +489,7 @@ router.post('/', attachFinancialYear, enforceOpenYear, requireUnlockedFY, checkI
   const extra = {
     ...(creditWarning || {}),
     ...(stockWarnings.length ? { stock_warnings: stockWarnings } : {}),
+    ...(mrpWarnings.length ? { mrp_warnings: mrpWarnings } : {}),
   };
   return res.status(201).json({ ...invoice, ...extra });
 });
@@ -531,7 +510,10 @@ router.put('/:id', async (req, res) => {
     due_date: req.body.due_date,
     valid_until: req.body.valid_until,
   }, fy) : { invoiceDate: existing.invoice_date, dueDate: null, validUntil: null };
-  const totals = computeInvoiceTotals(items, discount_amount);
+  const business = await prisma.business.findUnique({ where: { id: businessId }, select: { rates_include_gst: true, business_type: true } });
+  // a bill keeps the pricing mode it was made with, even if the setting changes later
+  const totals = computeInvoiceTotals(items, discount_amount, { inclusive: existing.rates_include_gst });
+  let mrpWarnings = [];
 
   const updated = await prisma.$transaction(async (tx) => {
     await lockRow(tx, 'invoice', existing.id);
@@ -545,6 +527,7 @@ router.put('/:id', async (req, res) => {
       linked_invoice_id: existing.linked_invoice_id, lines: totals.lines,
     });
     await validateReturnQuantities(tx, businessId, existing.voucher_type, linked, totals.lines, existing.id);
+    mrpWarnings = await validateBatchLines(tx, { businessId, business: { ...business, rates_include_gst: existing.rates_include_gst }, user: req.user, voucher_type: existing.voucher_type, lines: totals.lines });
 
     await tx.invoiceItem.deleteMany({ where: { invoice_id: existing.id } });
     return tx.invoice.update({
@@ -557,6 +540,7 @@ router.put('/:id', async (req, res) => {
         valid_until: dates.validUntil ?? existing.valid_until,
         subtotal: totals.subtotal,
         discount_amount: totals.discount_amount,
+        discount_incl: totals.discount_incl,
         tax_amount: totals.tax_amount,
         total_amount: totals.total_amount,
         balance_due: totals.total_amount - existing.amount_paid,
@@ -568,7 +552,7 @@ router.put('/:id', async (req, res) => {
     });
   });
 
-  return res.json(updated);
+  return res.json({ ...updated, ...(mrpWarnings.length ? { mrp_warnings: mrpWarnings } : {}) });
 });
 
 // ── POST /api/invoices/:id/send — finalize a draft ───────────────────────────

@@ -49,6 +49,13 @@ model Business {
   logo_url              String?
   // Bill design: options (not free-form HTML) plus the small images the bill can show
   bill_design           Json?
+  business_type         String   @default("general") // general | medical | fmcg
+  drug_license_20       String?
+  drug_license_21       String?
+  fssai_no              String?
+  rates_include_gst     Boolean  @default(false)
+  near_expiry_days      Int      @default(90)
+  batches               Batch[]
   logo_data             String?
   signature_data        String?
   upi_id                String?
@@ -189,7 +196,8 @@ model Supplier {
   business        Business              @relation(fields: [business_id], references: [id])
   ledgerEntries   SupplierLedgerEntry[]
 
-  @@index([business_id, is_deleted])
+  @@index([business_id, is_deleted])
+  batches          Batch[]
 }
 
 model SupplierLedgerEntry {
@@ -247,6 +255,13 @@ model Product {
   updated_at      DateTime         @updatedAt
   invoiceItems    InvoiceItem[]
   barcodes        ProductBarcode[]
+  mrp             Int              @default(0)
+  track_batches   Boolean          @default(false)
+  pack_size       String?
+  schedule        String?
+  manufacturer    String?
+  composition     String?
+  batches         Batch[]
   business        Business         @relation(fields: [business_id], references: [id])
   category        ProductCategory? @relation(fields: [category_id], references: [id])
 
@@ -273,6 +288,8 @@ model ProductBarcode {
 model Invoice {
   id                String         @id @default(cuid())
   business_id       String
+  rates_include_gst Boolean        @default(false) // the rates on this bill include GST (MRP-style pricing)
+  discount_incl     Int?           // the invoice discount as typed when rates include GST (discount_amount is its GST-exclusive part)
   customer_id       String?
   invoice_number    String
   invoice_date      DateTime       @default(now())
@@ -328,8 +345,18 @@ model InvoiceItem {
   tax_amount       Int      @default(0)
   amount           Int      @default(0)
   created_at       DateTime @default(now())
+  batch_id         String?
+  batch_no         String?
+  expiry_date      DateTime?
+  mfg_date         DateTime?
+  mrp              Int?
+  free_qty         Float    @default(0)
+  cost_price       Int?     // cost per unit of the batch at the time of sale (for exact profit)
+  batch_sale_price Int?     // on a purchase line: the selling price to set for the new batch
+  expired_override_reason String?
   invoice          Invoice  @relation(fields: [invoice_id], references: [id])
   product          Product? @relation(fields: [product_id], references: [id])
+  batch            Batch?   @relation(fields: [batch_id], references: [id])
 
   @@index([invoice_id])
   @@index([product_id])
@@ -478,4 +505,31 @@ model FundTransfer {
   @@index([business_id])
   @@index([from_account_id])
   @@index([to_account_id])
+}
+
+// One purchase lot of an item (medical / FMCG): own batch number, expiry, MRP, cost, selling price and quantity left.
+// A product with track_batches keeps its stock per batch; Product.stock_quantity stays the total.
+model Batch {
+  id             String        @id @default(cuid())
+  business_id    String
+  product_id     String
+  supplier_id    String?
+  batch_no       String
+  expiry_date    DateTime?
+  mfg_date       DateTime?
+  mrp            Int           @default(0)
+  purchase_price Int           @default(0)
+  sale_price     Int?
+  quantity       Float         @default(0)
+  is_opening     Boolean       @default(false)
+  created_at     DateTime      @default(now())
+  updated_at     DateTime      @updatedAt
+  business       Business      @relation(fields: [business_id], references: [id])
+  product        Product       @relation(fields: [product_id], references: [id])
+  supplier       Supplier?     @relation(fields: [supplier_id], references: [id])
+  invoiceItems   InvoiceItem[]
+
+  @@unique([product_id, batch_no, mrp, purchase_price])
+  @@index([business_id, expiry_date])
+  @@index([product_id])
 }

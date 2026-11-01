@@ -6,6 +6,7 @@ const TABLES = {
   supplier: '"Supplier"',
   invoice: '"Invoice"',
   product: '"Product"',
+  batch: '"Batch"',
   bankAccount: '"bank_accounts"',
   financialYear: '"FinancialYear"',
   payment: '"Payment"',
