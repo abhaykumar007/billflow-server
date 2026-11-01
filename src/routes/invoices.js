@@ -389,13 +389,19 @@ router.get('/:id/print', async (req, res) => {
 });
 
 // ── POST /api/invoices ────────────────────────────────────────────────────────
-router.post('/', attachFinancialYear, enforceOpenYear, requireUnlockedFY, checkInvoiceLimit, async (req, res) => {
-  const businessId = req.user.businessId;
+// Thrown inside the transaction of a dry run, to roll everything back while still handing the result out
+class DryRunDone extends Error { constructor(result) { super('dry run'); this.result = result; } }
+
+// Makes one bill: the checks, the numbering, the stock and the ledger. The sheet import calls this too, so an imported bill
+// gets exactly the checks a typed one does.
+//   prepare(tx): optional; runs first inside the transaction and may return { customer_id, supplier_id, items } to use instead
+//   dryRun: do everything, then roll back and return what would have been saved
+async function createInvoiceCore({ user, fy, body, key = null, prepare = null, dryRun = false }) {
+  const businessId = user.businessId;
   const {
-    voucher_type = 'SALE', customer_id, supplier_id, linked_invoice_id,
-    invoice_number: providedNumber, status = 'draft', items, discount_amount = 0, notes, terms,
-  } = req.body;
-  const fy = req.financialYear;
+    voucher_type = 'SALE', linked_invoice_id,
+    invoice_number: providedNumber, status = 'draft', discount_amount = 0, notes, terms, external_ref,
+  } = body;
 
   if (![...SALE_TYPES, ...PURCHASE_TYPES, ...ESTIMATE_TYPES].includes(voucher_type)) {
     throw new HttpError(400, 'Invalid voucher_type', 'VALIDATION');
@@ -407,91 +413,107 @@ router.post('/', attachFinancialYear, enforceOpenYear, requireUnlockedFY, checkI
   const isPurchase = PURCHASE_TYPES.includes(voucher_type);
 
   await assertCanPost(prisma, fy);
-  const { invoiceDate, dueDate, validUntil } = parseDates(req.body, fy);
+  const { invoiceDate, dueDate, validUntil } = parseDates(body, fy);
   const business = await prisma.business.findUnique({ where: { id: businessId }, select: { rates_include_gst: true, business_type: true } });
-  const totals = computeInvoiceTotals(items, discount_amount, { inclusive: business.rates_include_gst });   // server is the source of truth
-  const key = idempotencyKey(req);
 
   if (key) {
     const dup = await prisma.invoice.findFirst({
       where: { business_id: businessId, idempotency_key: key },
       include: { customer: true, supplier: true, items: true },
     });
-    if (dup) return res.status(200).json({ ...dup, idempotent_replay: true });
+    if (dup) return { replay: dup };
   }
 
   let creditWarning = null;
   let stockWarnings = [];
   let mrpWarnings = [];
-
-  const invoice = await prisma.$transaction(async (tx) => {
-    const { customer, linked } = await validateReferences(tx, businessId, {
-      voucher_type, customer_id, supplier_id, linked_invoice_id, lines: totals.lines,
-    });
-    await validateReturnQuantities(tx, businessId, voucher_type, linked, totals.lines, null);
-    mrpWarnings = await validateBatchLines(tx, { businessId, business, user: req.user, voucher_type, lines: totals.lines });
-
-    // Credit limit (SALE only)
-    if (voucher_type === 'SALE' && customer?.credit_limit > 0) {
-      await lockRow(tx, 'customer', customer.id);
-      const agg = await tx.invoice.aggregate({
-        where: { customer_id, business_id: businessId, voucher_type: 'SALE', status: { in: ['sent', 'partial'] }, is_deleted: false },
-        _sum: { balance_due: true },
-      });
-      const used = agg._sum.balance_due || 0;
-      if (used + totals.total_amount > customer.credit_limit) {
-        const msg = `Credit limit exceeded. Limit: ₹${(customer.credit_limit / 100).toFixed(2)}, Already used: ₹${(used / 100).toFixed(2)}, This invoice: ₹${(totals.total_amount / 100).toFixed(2)}.`;
-        const detail = { code: 'CREDIT_LIMIT_EXCEEDED', credit_limit: customer.credit_limit, credit_used: used, invoice_total: totals.total_amount };
-        if (customer.credit_limit_type === 'hard') throw new HttpError(422, msg, 'CREDIT_LIMIT_EXCEEDED', detail);
-        creditWarning = { warning: true, message: msg, ...detail };
-      }
-    }
-
-    const generated = await allocateInvoiceNumber(tx, voucher_type, fy, businessId);
-    const finalNumber = providedNumber ? String(providedNumber).trim().slice(0, 40) : generated;
-
-    const created = await tx.invoice.create({
-      data: {
-        business_id: businessId,
-        financial_year_id: fy.id,
-        voucher_type,
-        customer_id: (isSale || isEstimate) ? (customer_id || null) : null,
-        supplier_id: isPurchase ? supplier_id : null,
-        linked_invoice_id: linked ? linked.id : null,
-        invoice_number: finalNumber,
-        invoice_date: invoiceDate,
-        due_date: dueDate,
-        valid_until: validUntil,
-        status,
-        subtotal: totals.subtotal,
-        discount_amount: totals.discount_amount,
-        discount_incl: totals.discount_incl,
-        rates_include_gst: business.rates_include_gst,
-        tax_amount: totals.tax_amount,
-        total_amount: totals.total_amount,
-        amount_paid: 0,
-        balance_due: totals.total_amount,
-        notes: notes ? String(notes).slice(0, 2000) : null,
-        terms: terms ? String(terms).slice(0, 2000) : null,
-        created_by: req.user.userId,
-        idempotency_key: key,
-        items: { create: totals.lines },
-      },
-      include: { customer: true, supplier: true, items: true },
-    });
-
-    if (!isEstimate && status !== 'draft') {
-      stockWarnings = await postVoucher(tx, created, created.items, { fyId: fy.id, entryDate: invoiceDate });
-    }
-    return created;
-  });
-
-  const extra = {
+  let totals;
+  const extraOf = () => ({
     ...(creditWarning || {}),
     ...(stockWarnings.length ? { stock_warnings: stockWarnings } : {}),
     ...(mrpWarnings.length ? { mrp_warnings: mrpWarnings } : {}),
-  };
-  return res.status(201).json({ ...invoice, ...extra });
+  });
+
+  try {
+    const invoice = await prisma.$transaction(async (tx) => {
+      const patch = prepare ? await prepare(tx) : {};
+      const customer_id = patch.customer_id !== undefined ? patch.customer_id : body.customer_id;
+      const supplier_id = patch.supplier_id !== undefined ? patch.supplier_id : body.supplier_id;
+      totals = computeInvoiceTotals(patch.items || body.items, discount_amount, { inclusive: business.rates_include_gst });   // server is the source of truth
+
+      const { customer, linked } = await validateReferences(tx, businessId, {
+        voucher_type, customer_id, supplier_id, linked_invoice_id, lines: totals.lines,
+      });
+      await validateReturnQuantities(tx, businessId, voucher_type, linked, totals.lines, null);
+      mrpWarnings = await validateBatchLines(tx, { businessId, business, user, voucher_type, lines: totals.lines });
+
+      // Credit limit (SALE only)
+      if (voucher_type === 'SALE' && customer?.credit_limit > 0) {
+        await lockRow(tx, 'customer', customer.id);
+        const agg = await tx.invoice.aggregate({
+          where: { customer_id, business_id: businessId, voucher_type: 'SALE', status: { in: ['sent', 'partial'] }, is_deleted: false },
+          _sum: { balance_due: true },
+        });
+        const used = agg._sum.balance_due || 0;
+        if (used + totals.total_amount > customer.credit_limit) {
+          const msg = `Credit limit exceeded. Limit: ₹${(customer.credit_limit / 100).toFixed(2)}, Already used: ₹${(used / 100).toFixed(2)}, This invoice: ₹${(totals.total_amount / 100).toFixed(2)}.`;
+          const detail = { code: 'CREDIT_LIMIT_EXCEEDED', credit_limit: customer.credit_limit, credit_used: used, invoice_total: totals.total_amount };
+          if (customer.credit_limit_type === 'hard') throw new HttpError(422, msg, 'CREDIT_LIMIT_EXCEEDED', detail);
+          creditWarning = { warning: true, message: msg, ...detail };
+        }
+      }
+
+      const generated = await allocateInvoiceNumber(tx, voucher_type, fy, businessId);
+      const finalNumber = providedNumber ? String(providedNumber).trim().slice(0, 40) : generated;
+
+      const created = await tx.invoice.create({
+        data: {
+          business_id: businessId,
+          financial_year_id: fy.id,
+          voucher_type,
+          customer_id: (isSale || isEstimate) ? (customer_id || null) : null,
+          supplier_id: isPurchase ? supplier_id : null,
+          linked_invoice_id: linked ? linked.id : null,
+          invoice_number: finalNumber,
+          invoice_date: invoiceDate,
+          due_date: dueDate,
+          valid_until: validUntil,
+          status,
+          subtotal: totals.subtotal,
+          discount_amount: totals.discount_amount,
+          discount_incl: totals.discount_incl,
+          rates_include_gst: business.rates_include_gst,
+          tax_amount: totals.tax_amount,
+          total_amount: totals.total_amount,
+          amount_paid: 0,
+          balance_due: totals.total_amount,
+          notes: notes ? String(notes).slice(0, 2000) : null,
+          terms: terms ? String(terms).slice(0, 2000) : null,
+          external_ref: external_ref ? String(external_ref).trim().slice(0, 60) : null,
+          created_by: user.userId,
+          idempotency_key: key,
+          items: { create: totals.lines },
+        },
+        include: { customer: true, supplier: true, items: true },
+      });
+
+      if (!isEstimate && status !== 'draft') {
+        stockWarnings = await postVoucher(tx, created, created.items, { fyId: fy.id, entryDate: invoiceDate });
+      }
+      if (dryRun) throw new DryRunDone({ invoice: created, extra: extraOf() });
+      return created;
+    });
+    return { invoice, extra: extraOf() };
+  } catch (err) {
+    if (err instanceof DryRunDone) return err.result;
+    throw err;
+  }
+}
+
+router.post('/', attachFinancialYear, enforceOpenYear, requireUnlockedFY, checkInvoiceLimit, async (req, res) => {
+  const result = await createInvoiceCore({ user: req.user, fy: req.financialYear, body: req.body, key: idempotencyKey(req) });
+  if (result.replay) return res.status(200).json({ ...result.replay, idempotent_replay: true });
+  return res.status(201).json({ ...result.invoice, ...result.extra });
 });
 
 // ── PUT /api/invoices/:id — only drafts can be edited ─────────────────────────
@@ -690,3 +712,4 @@ router.delete('/:id', async (req, res) => {
 });
 
 module.exports = router;
+module.exports.createInvoiceCore = createInvoiceCore;

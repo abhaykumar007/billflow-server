@@ -313,6 +313,7 @@ model Invoice {
   valid_until       DateTime?
   voucher_type      String         @default("SALE")
   idempotency_key   String?
+  external_ref      String?        // the bill number it came with: the supplier's own number, or the one in the imported sheet
   business          Business       @relation(fields: [business_id], references: [id])
   creator           User           @relation("CreatedBy", fields: [created_by], references: [id])
   customer          Customer?      @relation(fields: [customer_id], references: [id])
@@ -326,6 +327,7 @@ model Invoice {
   @@unique([business_id, invoice_number])
   @@unique([business_id, idempotency_key])
   @@index([business_id, financial_year_id, voucher_type, status])
+  @@index([business_id, voucher_type, external_ref])
   @@index([business_id, customer_id])
   @@index([business_id, supplier_id])
   @@index([business_id, invoice_date])
