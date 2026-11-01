@@ -279,3 +279,62 @@ test('render: text size visibly changes every size on A4, A5 and receipts', asyn
   assert.equal(unknown.includes('body{font-family:Arial, Helvetica, sans-serif;font-size:12px'), true);
   assert.equal(medium.includes('font-size:12px'), true);
 });
+
+const packedLine = (over = {}) => ({ id: 'l1', description: 'Paracetamol 500mg', quantity: 3, unit: 'pcs', rate: 11800, discount_percent: 0, tax_rate: 12, tax_amount: 3793, amount: 31607, batch_no: 'PC23A', expiry_date: new Date('2027-06-30T00:00:00Z'), mrp: 12000, free_qty: 0, product: null, ...over });
+const packedBill = (items, over = {}) => ({ ...sampleInvoice(biz()), items, rates_include_gst: false, ...over });
+const tableText = (html) => (html.match(/<thead>[\s\S]*?<\/tbody>/) || [''])[0].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
+
+test('bill: batch, expiry and MRP columns show for medical/FMCG only when a line has them', async () => {
+  const medical = biz({ business_type: 'medical' });
+  const html = await renderBill({ invoice: packedBill([packedLine()]), business: medical, design: null });
+  assert.match(tableText(html), /Batch Exp MRP \(₹\) Qty/);
+  assert.match(tableText(html), /PC23A Jun 27 ₹120\.00 3/);
+  const plain = await renderBill({ invoice: packedBill([packedLine({ batch_no: null, expiry_date: null, mrp: 0 })]), business: medical, design: null });
+  assert.doesNotMatch(tableText(plain), /Batch|Exp|MRP/);
+  const general = await renderBill({ invoice: packedBill([packedLine()]), business: biz(), design: null });
+  assert.doesNotMatch(tableText(general), /Batch|MRP/);
+  const off = await renderBill({ invoice: packedBill([packedLine()]), business: medical, design: { columns: { batch: false, expiry: false, mrp: false } } });
+  assert.doesNotMatch(tableText(off), /Batch|MRP/);
+});
+
+test('bill: free pieces column only when some line has free pieces', async () => {
+  const withFree = await renderBill({ invoice: packedBill([packedLine({ free_qty: 2 })]), business: biz({ business_type: 'fmcg' }), design: null });
+  assert.match(tableText(withFree), /Qty Free Unit/);
+  const none = await renderBill({ invoice: packedBill([packedLine()]), business: biz({ business_type: 'fmcg' }), design: null });
+  assert.doesNotMatch(tableText(none), /Free/);
+});
+
+test('bill: GST-inclusive bill shows what the customer pays on each line, and says so', async () => {
+  const html = await renderBill({ invoice: packedBill([packedLine()], { rates_include_gst: true, subtotal: 31607, tax_amount: 3793, total_amount: 35400 }), business: biz({ business_type: 'medical' }), design: null });
+  assert.match(tableText(html), /Rate \(₹\) incl\. GST/);
+  assert.match(tableText(html), /₹354\.00/);
+  assert.match(html, /Subtotal \(before GST\)/);
+});
+
+test('bill: licence and FSSAI lines print under the business name, and can be switched off', async () => {
+  const b = biz({ drug_license_20: 'KA-20/1', drug_license_21: 'KA-21/1', fssai_no: '12345678901234' });
+  const html = await renderBill({ invoice: sampleInvoice(b), business: b, design: null });
+  assert.match(html, /D\.L\. No: 20: KA-20\/1 {2}21: KA-21\/1/);
+  assert.match(html, /FSSAI Lic\. No: 12345678901234/);
+  const off = await renderBill({ invoice: sampleInvoice(b), business: b, design: { header: { licences: false } } });
+  assert.doesNotMatch(off, /D\.L\.|FSSAI/);
+  const none = await renderBill({ invoice: sampleInvoice(biz()), business: biz(), design: null });
+  assert.doesNotMatch(none, /D\.L\.|FSSAI/);
+});
+
+test('bill: receipts show batch, expiry and MRP under the item, and licence text is escaped', async () => {
+  const b = biz({ business_type: 'medical', drug_license_20: '<b>x</b>' });
+  const html = await renderBill({ invoice: packedBill([packedLine({ free_qty: 1, batch_no: 'A&B' })]), business: b, design: null, paper: 't80' });
+  assert.match(html, /Batch A&amp;B · Exp Jun 27 · MRP ₹120\.00/);
+  assert.match(html, /3\+1 free pcs/);
+  assert.doesNotMatch(html, /<b>x<\/b>/);
+});
+
+test('bill: sample bills for medical and FMCG carry batch data and total correctly', () => {
+  for (const type of ['medical', 'fmcg']) {
+    const inv = sampleInvoice(biz({ business_type: type }));
+    assert.ok(inv.items.every((i) => i.batch_no && i.expiry_date && i.mrp > 0), type);
+    assert.equal(inv.subtotal + inv.tax_amount, inv.total_amount);
+    assert.equal(inv.items.reduce((s, i) => s + i.amount, 0), inv.subtotal);
+  }
+});

@@ -29,6 +29,10 @@ const DEFAULT_LABELS = {
   col_discount: 'Disc%',
   col_tax: 'GST%',
   col_amount: 'Amount (₹)',
+  col_batch: 'Batch',
+  col_expiry: 'Exp',
+  col_mrp: 'MRP (₹)',
+  col_free: 'Free',
 };
 
 const DEFAULT_DESIGN = {
@@ -38,9 +42,9 @@ const DEFAULT_DESIGN = {
   font: 'sans',
   font_size: 'medium',
   paper: 'a4',
-  header: { logo: true, logo_size: 'medium', logo_position: 'left', name: true, address: true, gstin: true, phone: true, email: true },
+  header: { logo: true, logo_size: 'medium', logo_position: 'left', name: true, address: true, gstin: true, phone: true, email: true, licences: true },
   party: { phone: true, address: true, gstin: true },
-  columns: { serial: true, hsn: false, unit: true, rate: true, discount: true, tax_rate: true },
+  columns: { serial: true, hsn: false, unit: true, rate: true, discount: true, tax_rate: true, batch: false, expiry: false, mrp: false, free: true },
   labels: { ...DEFAULT_LABELS },
   totals: { amount_in_words: true, tax_breakup: true, payments: true },
   extras: { bank: false, bank_account_id: null, upi_qr: false, upi_with_amount: true, signature: true, signatory_text: 'Authorised Signatory', notes: true, terms: true, footer_text: '', computer_generated: true, paid_stamp: true },
@@ -76,6 +80,8 @@ function sanitizeDesign(input, business) {
   const h = d.header || {}; const p = d.party || {}; const c = d.columns || {}; const l = d.labels || {};
   const t = d.totals || {}; const x = d.extras || {};
   const D = DEFAULT_DESIGN;
+  // Medical and FMCG shops print batch, expiry and MRP unless they switch it off (a column still only appears when a line has the data)
+  const packed = !!business && (business.business_type === 'medical' || business.business_type === 'fmcg');
 
   const labels = {};
   for (const k of Object.keys(DEFAULT_LABELS)) {
@@ -92,11 +98,12 @@ function sanitizeDesign(input, business) {
     paper: pick(d.paper, PAPERS, D.paper),
     header: {
       logo: bool(h.logo, D.header.logo), logo_size: pick(h.logo_size, LOGO_SIZES, D.header.logo_size), logo_position: pick(h.logo_position, LOGO_POSITIONS, D.header.logo_position),
-      name: bool(h.name, true), address: bool(h.address, true), gstin: bool(h.gstin, true), phone: bool(h.phone, true), email: bool(h.email, true),
+      name: bool(h.name, true), address: bool(h.address, true), gstin: bool(h.gstin, true), phone: bool(h.phone, true), email: bool(h.email, true), licences: bool(h.licences, true),
     },
     party: { phone: bool(p.phone, true), address: bool(p.address, true), gstin: bool(p.gstin, true) },
     columns: {
       serial: bool(c.serial, true), hsn: bool(c.hsn, false), unit: bool(c.unit, true), rate: bool(c.rate, true), discount: bool(c.discount, true), tax_rate: bool(c.tax_rate, true),
+      batch: bool(c.batch, packed), expiry: bool(c.expiry, packed), mrp: bool(c.mrp, packed), free: bool(c.free, true),
     },
     labels,
     totals: { amount_in_words: bool(t.amount_in_words, true), tax_breakup: bool(t.tax_breakup, true), payments: bool(t.payments, true) },

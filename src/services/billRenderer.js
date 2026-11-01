@@ -15,6 +15,14 @@ const fmtDate = (d) => {
   if (Number.isNaN(dt.getTime())) return '';
   return new Intl.DateTimeFormat('en-IN', { day: '2-digit', month: 'short', year: 'numeric', timeZone: 'UTC' }).format(dt);
 };
+const fmtExpiry = (d) => {
+  if (!d) return '';
+  const dt = new Date(d);
+  if (Number.isNaN(dt.getTime())) return '';
+  return new Intl.DateTimeFormat('en-IN', { month: 'short', year: '2-digit', timeZone: 'UTC' }).format(dt);
+};
+// With GST-inclusive rates the stored line amount is before GST; the bill shows what the customer pays for the line.
+const lineAmount = (it, invoice) => (invoice.rates_include_gst ? Math.round(it.rate * it.quantity * (1 - (it.discount_percent || 0) / 100)) : it.amount);
 const num = (n) => (Number.isInteger(n) ? String(n) : String(Math.round(n * 1e4) / 1e4));
 
 const PAPER = {
@@ -69,31 +77,41 @@ async function upiQrSvg(business, invoice, withAmount) {
   return QRCode.toString(link, { type: 'svg', margin: 0, errorCorrectionLevel: 'M' });
 }
 
-function buildColumns(design, labels) {
+function buildColumns(design, labels, items = [], inclusive = false) {
   const c = design.columns;
   const cols = [];
+  // batch, expiry, MRP and free pieces only take room on a bill where some line actually has them
+  const has = (f) => items.some((i) => f(i));
   if (c.serial) cols.push({ key: 'serial', label: labels.col_serial, align: 'left', w: '28px' });
   cols.push({ key: 'description', label: labels.col_description, align: 'left' });
   if (c.hsn) cols.push({ key: 'hsn', label: labels.col_hsn, align: 'left' });
+  if (c.batch && has((i) => i.batch_no)) cols.push({ key: 'batch', label: labels.col_batch, align: 'left' });
+  if (c.expiry && has((i) => i.expiry_date)) cols.push({ key: 'expiry', label: labels.col_expiry, align: 'left' });
+  if (c.mrp && has((i) => i.mrp > 0)) cols.push({ key: 'mrp', label: labels.col_mrp, align: 'right' });
   cols.push({ key: 'qty', label: labels.col_qty, align: 'right' });
+  if (c.free && has((i) => i.free_qty > 0)) cols.push({ key: 'free', label: labels.col_free, align: 'right' });
   if (c.unit) cols.push({ key: 'unit', label: labels.col_unit, align: 'left' });
-  if (c.rate) cols.push({ key: 'rate', label: labels.col_rate, align: 'right' });
+  if (c.rate) cols.push({ key: 'rate', label: inclusive ? `${labels.col_rate} incl. GST` : labels.col_rate, align: 'right' });
   if (c.discount) cols.push({ key: 'discount', label: labels.col_discount, align: 'right' });
   if (c.tax_rate) cols.push({ key: 'tax', label: labels.col_tax, align: 'right' });
   cols.push({ key: 'amount', label: labels.col_amount, align: 'right' });
   return cols;
 }
-function cell(col, it, idx) {
+function cell(col, it, idx, invoice = {}) {
   switch (col.key) {
     case 'serial': return String(idx + 1);
     case 'description': return esc(it.description);
     case 'hsn': return esc(it.product?.hsn_code || '');
+    case 'batch': return esc(it.batch_no || '');
+    case 'expiry': return fmtExpiry(it.expiry_date);
+    case 'mrp': return it.mrp > 0 ? inr(it.mrp) : '';
+    case 'free': return it.free_qty > 0 ? num(it.free_qty) : '—';
     case 'qty': return num(it.quantity);
     case 'unit': return esc(it.unit);
     case 'rate': return inr(it.rate);
     case 'discount': return it.discount_percent > 0 ? `${num(it.discount_percent)}%` : '—';
     case 'tax': return `${num(it.tax_rate)}%`;
-    case 'amount': return inr(it.amount);
+    case 'amount': return inr(lineAmount(it, invoice));
     default: return '';
   }
 }
@@ -158,6 +176,15 @@ table.items tbody tr:nth-child(even) td{${compact ? '' : 'background:#f8fafc'}}
 `;
 }
 
+// Drug licence and FSSAI numbers a medical or food business must print on its bills
+function licenceLines(business, h) {
+  if (!h.licences) return [];
+  return [
+    business.drug_license_20 || business.drug_license_21 ? `D.L. No: ${[business.drug_license_20 && `20: ${business.drug_license_20}`, business.drug_license_21 && `21: ${business.drug_license_21}`].filter(Boolean).join('  ')}` : '',
+    business.fssai_no ? `FSSAI Lic. No: ${business.fssai_no}` : '',
+  ].filter(Boolean);
+}
+
 function headerHtml(ctx) {
   const { design, business, invoice, labels, title, logoSrc } = ctx;
   const h = design.header;
@@ -167,6 +194,7 @@ function headerHtml(ctx) {
     h.name ? `<p class="biz-name">${esc(business.name)}</p>` : '',
     h.address && addr ? `<p class="gray">${esc(addr)}</p>` : '',
     h.gstin && business.gstin ? `<p class="gray">GSTIN: ${esc(business.gstin)}</p>` : '',
+    ...licenceLines(business, h).map((l) => `<p class="gray">${esc(l)}</p>`),
     h.phone && business.phone ? `<p class="gray">Ph: ${esc(business.phone)}</p>` : '',
     h.email && business.email ? `<p class="gray">${esc(business.email)}</p>` : '',
   ].join('');
@@ -184,7 +212,7 @@ ${design.party.phone && party.phone ? `<p class="gray">${esc(party.phone)}</p>` 
 
 function totalsHtml(ctx) {
   const { invoice, design, taxRows, isReturn } = ctx;
-  const rows = [`<div class="tr"><span>Subtotal</span><span>${inr(invoice.subtotal)}</span></div>`];
+  const rows = [`<div class="tr"><span>${invoice.rates_include_gst ? 'Subtotal (before GST)' : 'Subtotal'}</span><span>${inr(invoice.subtotal)}</span></div>`];
   if (invoice.discount_amount > 0) rows.push(`<div class="tr"><span>Discount</span><span>- ${inr(invoice.discount_amount)}</span></div>`);
   if (design.totals.tax_breakup) for (const t of taxRows) rows.push(`<div class="tr"><span>${esc(t.label)}</span><span>${inr(t.value)}</span></div>`);
   rows.push(`<div class="tr total"><span>Total</span><span>${inr(invoice.total_amount)}</span></div>`);
@@ -204,7 +232,7 @@ function paymentsHtml(ctx) {
 function renderStandard(ctx) {
   const { invoice, design, labels, columns } = ctx;
   const head = columns.map((c) => `<th style="text-align:${c.align};${c.w ? `width:${c.w}` : ''}">${esc(c.label)}</th>`).join('');
-  const body = invoice.items.map((it, i) => `<tr>${columns.map((c) => `<td style="text-align:${c.align}${c.key === 'description' ? ';font-weight:500' : ''}">${cell(c, it, i)}</td>`).join('')}</tr>`).join('');
+  const body = invoice.items.map((it, i) => `<tr>${columns.map((c) => `<td style="text-align:${c.align}${c.key === 'description' ? ';font-weight:500' : ''}">${cell(c, it, i, invoice)}</td>`).join('')}</tr>`).join('');
   const x = design.extras;
   const leftBits = [
     design.totals.amount_in_words ? `<p class="words"><b>Amount in words:</b> ${esc(amountInWords(invoice.total_amount))}</p>` : '',
@@ -226,14 +254,21 @@ ${extraBoxes ? `<div class="extras">${extraBoxes}</div>` : ''}
 <div class="foot">${x.footer_text ? `${esc(x.footer_text)}<br>` : ''}${x.computer_generated ? `This is a computer generated ${esc(ctx.title.toLowerCase())} &nbsp;·&nbsp; ${esc(ctx.business.name)}${ctx.business.gstin ? ` &nbsp;·&nbsp; GSTIN: ${esc(ctx.business.gstin)}` : ''}` : ''}</div>`;
 }
 
+// Batch, expiry and MRP of one line on a receipt, under the item name
+function packedLine(it, design) {
+  const c = design.columns;
+  const bits = [c.batch && it.batch_no ? `Batch ${esc(it.batch_no)}` : '', c.expiry && it.expiry_date ? `Exp ${fmtExpiry(it.expiry_date)}` : '', c.mrp && it.mrp > 0 ? `MRP ${inr(it.mrp)}` : ''].filter(Boolean);
+  return bits.length ? `<div class="gray">${bits.join(' · ')}</div>` : '';
+}
+
 function renderThermal(ctx) {
   const { invoice, design, business, party, title } = ctx;
   const h = design.header;
   const x = design.extras;
   const addr = [business.address, business.city, business.state].filter(Boolean).join(', ');
   const logo = h.logo && ctx.logoSrc ? `<img src="${esc(ctx.logoSrc)}" alt="" style="max-height:${Math.round(LOGO_HEIGHT[h.logo_size] * 0.8)}px;max-width:100%;object-fit:contain;display:block;margin:0 auto 3px">` : '';
-  const items = invoice.items.map((it) => `<div>${esc(it.description)}</div><div class="t-row"><span>${num(it.quantity)} ${esc(it.unit)} × ${inr(it.rate)}${it.discount_percent > 0 ? ` (-${num(it.discount_percent)}%)` : ''}</span><span>${inr(it.amount)}</span></div>`).join('<div class="dash" style="border-top-style:dotted"></div>');
-  return `<div class="center">${logo}${h.name ? `<p style="font-weight:bold;font-size:1.2em">${esc(business.name)}</p>` : ''}${h.address && addr ? `<p class="gray">${esc(addr)}</p>` : ''}${h.gstin && business.gstin ? `<p class="gray">GSTIN: ${esc(business.gstin)}</p>` : ''}${h.phone && business.phone ? `<p class="gray">Ph: ${esc(business.phone)}</p>` : ''}</div>
+  const items = invoice.items.map((it) => `<div>${esc(it.description)}</div><div class="t-row"><span>${num(it.quantity)}${it.free_qty > 0 ? `+${num(it.free_qty)} free` : ''} ${esc(it.unit)} × ${inr(it.rate)}${it.discount_percent > 0 ? ` (-${num(it.discount_percent)}%)` : ''}</span><span>${inr(lineAmount(it, invoice))}</span></div>${packedLine(it, design)}`).join('<div class="dash" style="border-top-style:dotted"></div>');
+  return `<div class="center">${logo}${h.name ? `<p style="font-weight:bold;font-size:1.2em">${esc(business.name)}</p>` : ''}${h.address && addr ? `<p class="gray">${esc(addr)}</p>` : ''}${h.gstin && business.gstin ? `<p class="gray">GSTIN: ${esc(business.gstin)}</p>` : ''}${licenceLines(business, h).map((l) => `<p class="gray">${esc(l)}</p>`).join('')}${h.phone && business.phone ? `<p class="gray">Ph: ${esc(business.phone)}</p>` : ''}</div>
 <div class="dash"></div>
 <div class="center"><p style="font-weight:bold;text-transform:uppercase">${esc(title)}</p></div>
 <div class="t-row"><span>${esc(invoice.invoice_number)}</span><span>${fmtDate(invoice.invoice_date)}</span></div>
@@ -280,7 +315,7 @@ async function renderBill({ invoice, business, design: rawDesign, paper, bank })
   const ctx = {
     invoice, business, design, labels, spec, party, isPurchase, isReturn, title, logoSrc, signatureSrc, bankHtml, qrSvg,
     taxRows: taxLines(invoice.items, gType, invoice),
-    columns: buildColumns(design, labels),
+    columns: buildColumns(design, labels, invoice.items, !!invoice.rates_include_gst),
     showSignature: design.extras.signature && (type === 'SALE' || type === 'SALE_RETURN' || type === 'ESTIMATE'),
   };
   const stamp = design.extras.paid_stamp && type === 'SALE' && invoice.status === 'paid' ? '<div class="stamp">PAID</div>' : '';
@@ -295,7 +330,22 @@ function sampleInvoice(business) {
   const today = new Date();
   const base = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()));
   const due = new Date(base.getTime() + 15 * 86400000);
-  const items = [
+  const day = (months) => new Date(Date.UTC(base.getUTCFullYear(), base.getUTCMonth() + months, 1));
+  const packedItems = {
+    medical: [
+      { id: 's1', description: 'Paracetamol 500mg (strip of 10)', quantity: 10, unit: 'strip', rate: 3000, discount_percent: 0, tax_rate: 12, tax_amount: 3214, amount: 26786, batch_no: 'PC23A', expiry_date: day(14), mrp: 3500, free_qty: 0, product: { hsn_code: '3004' } },
+      { id: 's2', description: 'Cough syrup 100ml', quantity: 3, unit: 'btl', rate: 8500, discount_percent: 5, tax_rate: 12, tax_amount: 2597, amount: 21542, batch_no: 'CS118', expiry_date: day(7), mrp: 9500, free_qty: 0, product: { hsn_code: '3004' } },
+      { id: 's3', description: 'Cotton roll 100g', quantity: 2, unit: 'pcs', rate: 4000, discount_percent: 0, tax_rate: 5, tax_amount: 381, amount: 7619, batch_no: 'CR77', expiry_date: day(30), mrp: 4500, free_qty: 0, product: { hsn_code: '3005' } },
+    ],
+    fmcg: [
+      { id: 's1', description: 'Basmati rice 5kg', quantity: 4, unit: 'bag', rate: 52000, discount_percent: 0, tax_rate: 5, tax_amount: 9905, amount: 198095, batch_no: 'R2405', expiry_date: day(10), mrp: 56000, free_qty: 0, product: { hsn_code: '1006' } },
+      { id: 's2', description: 'Biscuits family pack', quantity: 12, unit: 'pcs', rate: 3500, discount_percent: 0, tax_rate: 18, tax_amount: 6406, amount: 35594, batch_no: 'B0912', expiry_date: day(5), mrp: 4000, free_qty: 2, product: { hsn_code: '1905' } },
+      { id: 's3', description: 'Hand wash 250ml', quantity: 6, unit: 'btl', rate: 9900, discount_percent: 0, tax_rate: 18, tax_amount: 9061, amount: 50339, batch_no: 'H441', expiry_date: day(20), mrp: 11000, free_qty: 0, product: { hsn_code: '3401' } },
+    ],
+  }[business.business_type];
+  // amounts of the packed samples are worked out from rate, quantity, discount and GST, as the server does
+  const priced = (packedItems || []).map((it) => { const amount = Math.round(it.rate * it.quantity * (1 - it.discount_percent / 100)); return { ...it, amount, tax_amount: Math.round((amount * it.tax_rate) / 100) }; });
+  const items = packedItems ? priced : [
     { id: 's1', description: 'Wireless keyboard', quantity: 2, unit: 'pcs', rate: 150000, discount_percent: 10, tax_rate: 18, tax_amount: 48600, amount: 270000, product: { hsn_code: '8471' } },
     { id: 's2', description: 'Notebook A5 (pack of 10)', quantity: 5, unit: 'box', rate: 45000, discount_percent: 0, tax_rate: 12, tax_amount: 27000, amount: 225000, product: { hsn_code: '4820' } },
     { id: 's3', description: 'Delivery charge', quantity: 1, unit: 'pcs', rate: 20000, discount_percent: 0, tax_rate: 0, tax_amount: 0, amount: 20000, product: null },
