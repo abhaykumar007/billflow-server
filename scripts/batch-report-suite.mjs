@@ -91,6 +91,14 @@ const rep = (t, path) => call('GET', `/reports/${path}`, t);
   check('totals ignore limit (still 2 items)', (await rep(A.token, 'item-sales?limit=1')).json.totals.rows === 2);
   check('the old product-sales report still works', (await rep(A.token, 'product-sales')).status === 200);
 
+  // an item with no cost entered must not show a 100% margin
+  const nocost = (await call('POST', '/products', A.token, { name: nm('=NoCost'), sale_price: 200, tax_rate: 12, track_inventory: false })).json;
+  await bill(A.token, { customer_id: cust.id, items: [line(nocost, 2, 20000)] });
+  r = await rep(A.token, 'item-sales');
+  const inc = r.json.rows.find((x) => x.product_id === nocost.id);
+  check('item with no cost: sale counted, cost and profit left at 0, flagged cost_complete=false', inc.net_revenue === 40000 && inc.cost === 0 && inc.profit === 0 && inc.margin_pct === 0 && inc.cost_complete === false, JSON.stringify(inc));
+  check('items with a cost stay cost_complete=true', r.json.rows.find((x) => x.product_id === med.id).cost_complete === true);
+  check('totals: revenue includes the no-cost item, profit does not', r.json.totals.net_revenue === 123000 && r.json.totals.profit === 18000, JSON.stringify(r.json.totals));
   r = await rep(A.token, 'mrp-sales');
   const m1 = r.json.rows.find((x) => x.mrp === 12000); const m2 = r.json.rows.find((x) => x.mrp === 13000);
   check('mrp-sales: one row per MRP (120 and 130), plain item left out', r.json.rows.length === 2 && !!m1 && !!m2, JSON.stringify(r.json.rows.map((x) => x.mrp)));
@@ -99,7 +107,7 @@ const rep = (t, path) => call('GET', `/reports/${path}`, t);
 
   // ── dates ──────────────────────────────────────────────────────────────────
   check('a period in the past has no sales', (await rep(A.token, 'item-sales?from=2020-01-01&to=2020-01-31')).json.rows.length === 0);
-  check("today's date range includes today's bills", (await rep(A.token, `item-sales?from=${day(0)}&to=${day(0)}`)).json.rows.length === 2);
+  check("today's date range includes today's bills", (await rep(A.token, `item-sales?from=${day(0)}&to=${day(0)}`)).json.rows.length === 3);
   check('bad date refused', (await rep(A.token, 'batch-sales?from=2026-13-40')).status === 400);
   check('from after to refused', (await rep(A.token, 'batch-sales?from=2026-05-02&to=2026-05-01')).status === 400);
   check('bad product id refused', (await rep(A.token, 'batch-sales?product_id=a;b')).status === 400);

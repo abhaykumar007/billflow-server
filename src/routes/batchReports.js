@@ -149,7 +149,8 @@ async function saleLines(req) {
   });
   return lines.map((l) => {
     const sign = l.invoice.voucher_type === 'SALE_RETURN' ? -1 : 1;
-    const unitCost = l.cost_price != null ? l.cost_price : l.product?.purchase_price ?? null;
+    // a cost of 0 means no cost was ever entered (the default), so it counts as unknown rather than as a free item
+    const unitCost = l.cost_price > 0 ? l.cost_price : l.product?.purchase_price > 0 ? l.product.purchase_price : null;
     return { ...l, sign, unitCost };
   });
 }
