@@ -150,6 +150,7 @@ table.items{width:100%;border-collapse:collapse;margin-bottom:14px;font-size:${b
 table.items thead{display:table-header-group}
 table.items tr{page-break-inside:avoid}
 table.items th{padding:${compact ? '4px 6px' : '7px 8px'};font-weight:600;${compact ? `border-top:1px solid ${accent};border-bottom:1px solid ${accent};color:${accent}` : modern ? `background:${accent}1a;color:${accent};border-bottom:2px solid ${accent}` : `background:${accent};color:#fff`}}
+table.items td.nw{white-space:nowrap}
 table.items td{padding:${compact ? '3px 6px' : '6px 8px'};border-bottom:1px solid #e9eef4;vertical-align:top}
 table.items tbody tr:nth-child(even) td{${compact ? '' : 'background:#f8fafc'}}
 .two{display:flex;justify-content:space-between;gap:28px}
@@ -177,8 +178,10 @@ table.items tbody tr:nth-child(even) td{${compact ? '' : 'background:#f8fafc'}}
 }
 
 // Drug licence and FSSAI numbers a medical or food business must print on its bills
-function licenceLines(business, h) {
+function licenceLines(business, h, narrow = false) {
   if (!h.licences) return [];
+  // a receipt is too narrow for both licence numbers on one line
+  if (narrow) return [business.drug_license_20 && `D.L. 20: ${business.drug_license_20}`, business.drug_license_21 && `D.L. 21: ${business.drug_license_21}`, business.fssai_no && `FSSAI: ${business.fssai_no}`].filter(Boolean);
   return [
     business.drug_license_20 || business.drug_license_21 ? `D.L. No: ${[business.drug_license_20 && `20: ${business.drug_license_20}`, business.drug_license_21 && `21: ${business.drug_license_21}`].filter(Boolean).join('  ')}` : '',
     business.fssai_no ? `FSSAI Lic. No: ${business.fssai_no}` : '',
@@ -232,7 +235,7 @@ function paymentsHtml(ctx) {
 function renderStandard(ctx) {
   const { invoice, design, labels, columns } = ctx;
   const head = columns.map((c) => `<th style="text-align:${c.align};${c.w ? `width:${c.w}` : ''}">${esc(c.label)}</th>`).join('');
-  const body = invoice.items.map((it, i) => `<tr>${columns.map((c) => `<td style="text-align:${c.align}${c.key === 'description' ? ';font-weight:500' : ''}">${cell(c, it, i, invoice)}</td>`).join('')}</tr>`).join('');
+  const body = invoice.items.map((it, i) => `<tr>${columns.map((c) => `<td${['batch', 'expiry', 'mrp', 'qty', 'free', 'rate', 'amount'].includes(c.key) ? ' class="nw"' : ''} style="text-align:${c.align}${c.key === 'description' ? ';font-weight:500' : ''}">${cell(c, it, i, invoice)}</td>`).join('')}</tr>`).join('');
   const x = design.extras;
   const leftBits = [
     design.totals.amount_in_words ? `<p class="words"><b>Amount in words:</b> ${esc(amountInWords(invoice.total_amount))}</p>` : '',
@@ -268,7 +271,7 @@ function renderThermal(ctx) {
   const addr = [business.address, business.city, business.state].filter(Boolean).join(', ');
   const logo = h.logo && ctx.logoSrc ? `<img src="${esc(ctx.logoSrc)}" alt="" style="max-height:${Math.round(LOGO_HEIGHT[h.logo_size] * 0.8)}px;max-width:100%;object-fit:contain;display:block;margin:0 auto 3px">` : '';
   const items = invoice.items.map((it) => `<div>${esc(it.description)}</div><div class="t-row"><span>${num(it.quantity)}${it.free_qty > 0 ? `+${num(it.free_qty)} free` : ''} ${esc(it.unit)} × ${inr(it.rate)}${it.discount_percent > 0 ? ` (-${num(it.discount_percent)}%)` : ''}</span><span>${inr(lineAmount(it, invoice))}</span></div>${packedLine(it, design)}`).join('<div class="dash" style="border-top-style:dotted"></div>');
-  return `<div class="center">${logo}${h.name ? `<p style="font-weight:bold;font-size:1.2em">${esc(business.name)}</p>` : ''}${h.address && addr ? `<p class="gray">${esc(addr)}</p>` : ''}${h.gstin && business.gstin ? `<p class="gray">GSTIN: ${esc(business.gstin)}</p>` : ''}${licenceLines(business, h).map((l) => `<p class="gray">${esc(l)}</p>`).join('')}${h.phone && business.phone ? `<p class="gray">Ph: ${esc(business.phone)}</p>` : ''}</div>
+  return `<div class="center">${logo}${h.name ? `<p style="font-weight:bold;font-size:1.2em">${esc(business.name)}</p>` : ''}${h.address && addr ? `<p class="gray">${esc(addr)}</p>` : ''}${h.gstin && business.gstin ? `<p class="gray">GSTIN: ${esc(business.gstin)}</p>` : ''}${licenceLines(business, h, true).map((l) => `<p class="gray">${esc(l)}</p>`).join('')}${h.phone && business.phone ? `<p class="gray">Ph: ${esc(business.phone)}</p>` : ''}</div>
 <div class="dash"></div>
 <div class="center"><p style="font-weight:bold;text-transform:uppercase">${esc(title)}</p></div>
 <div class="t-row"><span>${esc(invoice.invoice_number)}</span><span>${fmtDate(invoice.invoice_date)}</span></div>

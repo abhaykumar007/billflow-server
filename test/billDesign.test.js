@@ -338,3 +338,13 @@ test('bill: sample bills for medical and FMCG carry batch data and total correct
     assert.equal(inv.items.reduce((s, i) => s + i.amount, 0), inv.subtotal);
   }
 });
+
+test('bill: receipts print each licence on its own line; A5 keeps batch, expiry and amounts on one line', async () => {
+  const b = biz({ business_type: 'medical', drug_license_20: 'KA-20/1', drug_license_21: 'KA-21/1', fssai_no: '12345678901234' });
+  const receipt = await renderBill({ invoice: sampleInvoice(b), business: b, design: null, paper: 't58' });
+  assert.match(receipt, /D\.L\. 20: KA-20\/1<\/p>/);
+  assert.match(receipt, /D\.L\. 21: KA-21\/1<\/p>/);
+  assert.match(receipt, /FSSAI: 12345678901234<\/p>/);
+  const a5 = await renderBill({ invoice: sampleInvoice(b), business: b, design: null, paper: 'a5' });
+  assert.match(a5, /<td class="nw" style="text-align:left">[A-Z0-9]+<\/td><td class="nw" style="text-align:left">\w{3} \d{2}<\/td>/);
+});
