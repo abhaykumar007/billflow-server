@@ -1994,18 +1994,30 @@ router.get('/balance-sheet', async (req, res) => {
     const g = (a, k) => a._sum[k] || 0;
     // stock_quantity is the CURRENT quantity, so stock value is as of today regardless of asOf
     const stockValue = products.reduce((s, p) => s + Math.round(Math.max(0, p.stock_quantity || 0) * (p.purchase_price || 0)), 0);
-    const total_receivable = (g(sale, 'total_amount') - g(saleRet, 'total_amount')) - g(rec, 'amount');
-    const total_payable = (g(purchase, 'total_amount') - g(purchaseRet, 'total_amount')) - g(paid, 'amount');
+    // Receivable and payable are the party ledger balances (opening balances, bills, payments, returns), the same figures as the
+    // dashboard and the ledger screens. A customer who has paid in advance is a liability; a supplier we paid in advance is an asset.
+    const fyWhere = req.financialYear ? { financial_year_id: req.financialYear.id } : {};
+    const [custLedger, supLedger] = await Promise.all([
+      prisma.ledgerEntry.groupBy({ by: ['customer_id'], where: { business_id: businessId, ...fyWhere }, _sum: { debit: true, credit: true } }),
+      prisma.supplierLedgerEntry.groupBy({ by: ['supplier_id'], where: { business_id: businessId, ...fyWhere }, _sum: { debit: true, credit: true } }),
+    ]);
+    const custBal = custLedger.filter((t) => t.customer_id).map((t) => (t._sum.debit || 0) - (t._sum.credit || 0));
+    const supBal = supLedger.filter((t) => t.supplier_id).map((t) => (t._sum.credit || 0) - (t._sum.debit || 0));
+    const total_receivable = custBal.reduce((s, b) => s + Math.max(0, b), 0);
+    const customer_advances = custBal.reduce((s, b) => s + Math.max(0, -b), 0);
+    const total_payable = supBal.reduce((s, b) => s + Math.max(0, b), 0);
+    const supplier_advances = supBal.reduce((s, b) => s + Math.max(0, -b), 0);
     const cash_and_bank = g(rec, 'amount') - g(paid, 'amount') - g(exp, 'amount');
-    const total_assets = stockValue + total_receivable + cash_and_bank;
+    const total_assets = stockValue + total_receivable + supplier_advances + cash_and_bank;
+    const total_liabilities = total_payable + customer_advances;
     res.json({
-      assets: { stock_value: stockValue, total_receivable, cash_and_bank, total_assets },
-      liabilities: { total_payable, total_liabilities: total_payable },
+      assets: { stock_value: stockValue, total_receivable, supplier_advances, cash_and_bank, total_assets },
+      liabilities: { total_payable, customer_advances, total_liabilities },
       // Not a true equity figure: there is no capital / retained-earnings ledger, so this is assets minus liabilities.
-      net_worth_estimate: total_assets - total_payable,
-      equity: total_assets - total_payable,
+      net_worth_estimate: total_assets - total_liabilities,
+      equity: total_assets - total_liabilities,
       as_of: asOf || ymd(todayDate()),
-      notes: 'Indicative only. Built from invoices, payments and expenses (no opening capital, fixed assets, loans or bank opening balances). Stock value uses current quantities at purchase price.',
+      notes: 'Indicative only. Built from invoices, payments and expenses (no opening capital, fixed assets, loans or bank opening balances). Stock value and party balances are as of today.',
     });
   } catch (err) {
     console.error('Balance sheet error:', err);
