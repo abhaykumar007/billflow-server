@@ -60,3 +60,8 @@ New tables/columns (additive migration `20261101000000_product_barcodes`): `Prod
 - A code belongs to one live item per business; another business may use the same number; a deleted item gives its codes back. At most 10 codes per item; labels: 1–100 items, 1–100 copies, 500 labels per request.
 - The label page is escaped, carries a content rule (no scripts, no network) and draws bars with `bwip-js`.
 - Tests: 12 new unit/route tests (`test/barcodes.test.js`), suite now 54/54. Break-it script `scripts/barcode-suite.mjs`: 53/53 locally (access control, tenant isolation, duplicates, junk input, limits, label caps, deleted items). Old suites unchanged: `api-suite` all checks pass (`UPGRADE=1`), `bill-design-suite` 60/60.
+
+## Offline support (branch `offline-system`, 2026-11-01)
+- `POST /invoices` accepts an optional `client_created_at` (when a phone that was offline really made the bill). It is stored as the bill's `created_at` only if it is a valid time, not in the future (a few minutes of clock drift is clamped to now) and not older than 90 days; otherwise the server time is used. Old clients are unaffected.
+- `GET /invoices` now orders by bill date, then creation time, then id (it ordered by date only, so same-day bills had no guaranteed order).
+- Tests: `test/madeAt.test.js` (3), server suite 57/57; barcode 53/53, bill-design 60/60, API 133/133 unchanged. Mixed phone + web scenarios: see the mobile repo's TEST_REPORT.md (16/16).

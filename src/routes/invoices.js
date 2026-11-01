@@ -10,6 +10,7 @@ const { computeInvoiceTotals } = require('../utils/money');
 const { effectiveDesign, PAPERS } = require('../services/billDesign');
 const { renderBill } = require('../services/billRenderer');
 const { parseDayStart, parseDayEnd, isValidDate, todayDate } = require('../utils/time');
+const { parseMadeAt } = require('../utils/validate');
 const {
   postCustomerEntry, postSupplierEntry, VOUCHERS,
   assertCanPost, assertRecordFyWritable, assertDateInFY, idempotencyKey,
@@ -326,7 +327,8 @@ router.get('/', attachFinancialYear, async (req, res) => {
           customer: { select: { id: true, name: true, phone: true } },
           supplier: { select: { id: true, name: true, phone: true } },
         },
-        orderBy: { invoice_date: 'desc' },
+        // same day: the bill made last comes first (created_at is the real time it was made, even for a bill made offline)
+        orderBy: [{ invoice_date: 'desc' }, { created_at: 'desc' }, { id: 'desc' }],
         skip,
         take: limit,
       }),
@@ -420,7 +422,7 @@ router.post('/', attachFinancialYear, enforceOpenYear, requireUnlockedFY, checkI
   const businessId = req.user.businessId;
   const {
     voucher_type = 'SALE', customer_id, supplier_id, linked_invoice_id,
-    invoice_number: providedNumber, status = 'draft', items, discount_amount = 0, notes, terms,
+    invoice_number: providedNumber, status = 'draft', items, discount_amount = 0, notes, terms, client_created_at,
   } = req.body;
   const fy = req.financialYear;
 
@@ -497,6 +499,7 @@ router.post('/', attachFinancialYear, enforceOpenYear, requireUnlockedFY, checkI
         terms: terms ? String(terms).slice(0, 2000) : null,
         created_by: req.user.userId,
         idempotency_key: key,
+        ...(parseMadeAt(client_created_at) ? { created_at: parseMadeAt(client_created_at) } : {}),
         items: { create: totals.lines },
       },
       include: { customer: true, supplier: true, items: true },
