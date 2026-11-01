@@ -290,6 +290,9 @@ model Invoice {
   business_id       String
   rates_include_gst Boolean        @default(false) // the rates on this bill include GST (MRP-style pricing)
   discount_incl     Int?           // the invoice discount as typed when rates include GST (discount_amount is its GST-exclusive part)
+  made_offline      Boolean        @default(false) // made on a phone without internet, sent later
+  offline_ref       String?        // the temporary number it had on the phone, e.g. OFFLINE-001
+  synced_at         DateTime?      // when it reached the server (created_at is when it was really made)
   customer_id       String?
   invoice_number    String
   invoice_date      DateTime       @default(now())

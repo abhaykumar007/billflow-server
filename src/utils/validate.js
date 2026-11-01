@@ -73,4 +73,15 @@ function pageParams(query, defLimit = 50, maxLimit = 200) {
   return { page, limit, skip: (page - 1) * limit };
 }
 
-module.exports = { parseParty, rupeesToPaise, pageParams, trimOrNull, GSTIN_RE, PAN_RE };
+// When a bill was really made, as sent by a phone that was offline. Used only to keep bills in the order they were made:
+// anything that is not a date, is in the future, or is more than 90 days old is ignored (the server's own time is used).
+const MAX_BACKDATE_MS = 90 * 24 * 60 * 60 * 1000;
+const FUTURE_SLACK_MS = 5 * 60 * 1000;
+function parseMadeAt(raw, now = Date.now()) {
+  if (typeof raw !== 'string' || raw.length > 40) return null;
+  const t = Date.parse(raw);
+  if (!Number.isFinite(t) || t > now + FUTURE_SLACK_MS || t < now - MAX_BACKDATE_MS) return null;
+  return new Date(Math.min(t, now));
+}
+
+module.exports = { parseParty, rupeesToPaise, pageParams, trimOrNull, parseMadeAt, GSTIN_RE, PAN_RE };

@@ -11,6 +11,7 @@ const { adjustInventory, validateBatchLines, assertSaleBatchesSellable } = requi
 const { effectiveDesign, PAPERS } = require('../services/billDesign');
 const { renderBill } = require('../services/billRenderer');
 const { parseDayStart, parseDayEnd, isValidDate, todayDate } = require('../utils/time');
+const { parseMadeAt } = require('../utils/validate');
 const {
   postCustomerEntry, postSupplierEntry, VOUCHERS,
   assertCanPost, assertRecordFyWritable, assertDateInFY, idempotencyKey,
@@ -299,7 +300,8 @@ router.get('/', attachFinancialYear, async (req, res) => {
           customer: { select: { id: true, name: true, phone: true } },
           supplier: { select: { id: true, name: true, phone: true } },
         },
-        orderBy: { invoice_date: 'desc' },
+        // same day: the bill made last comes first (created_at is the real time it was made, even for a bill made offline)
+        orderBy: [{ invoice_date: 'desc' }, { created_at: 'desc' }, { id: 'desc' }],
         skip,
         take: limit,
       }),
@@ -413,7 +415,7 @@ async function createInvoiceCore({ user, fy, body, key = null, prepare = null, d
   const businessId = user.businessId;
   const {
     voucher_type = 'SALE', linked_invoice_id,
-    invoice_number: providedNumber, status = 'draft', discount_amount = 0, notes, terms, external_ref,
+    invoice_number: providedNumber, status = 'draft', discount_amount = 0, notes, terms, external_ref, client_created_at, made_offline, offline_ref,
   } = body;
 
   if (![...SALE_TYPES, ...PURCHASE_TYPES, ...ESTIMATE_TYPES].includes(voucher_type)) {
@@ -506,6 +508,9 @@ async function createInvoiceCore({ user, fy, body, key = null, prepare = null, d
           external_ref: cleanRef(external_ref),
           created_by: user.userId,
           idempotency_key: key,
+          // a bill made on a phone without internet keeps the time it was really made and is marked as made offline
+          ...(parseMadeAt(client_created_at) ? { created_at: parseMadeAt(client_created_at) } : {}),
+          ...(made_offline === true ? { made_offline: true, synced_at: new Date(), offline_ref: typeof offline_ref === 'string' ? offline_ref.replace(/[^A-Za-z0-9._/-]/g, '').slice(0, 40) || null : null } : {}),
           items: { create: totals.lines },
         },
         include: { customer: true, supplier: true, items: true },

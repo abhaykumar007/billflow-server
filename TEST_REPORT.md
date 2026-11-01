@@ -80,3 +80,9 @@ Additive migration `20261103000000_batches_mrp_expiry` (new `Batch` table; new c
 - Unchanged and passing: server unit 63/63, barcode 53/53, bill design 60/60, API 133/133.
 
 **Not in this phase:** web and phone screens, bill printing (batch/expiry/MRP columns, licence lines), reports (near expiry, expired, batch-wise sale, item-wise sale), Excel import, offline batch support. Old phone/web apps keep working for items that do not track batches; an item with batches on needs the new screens to sell (phase 2+).
+
+## Offline support (branch `offline-system`, 2026-11-01)
+- `POST /invoices` accepts an optional `client_created_at` (when a phone that was offline really made the bill). It is stored as the bill's `created_at` only if it is a valid time, not in the future (a few minutes of clock drift is clamped to now) and not older than 90 days; otherwise the server time is used. Old clients are unaffected.
+- `GET /invoices` now orders by bill date, then creation time, then id (it ordered by date only, so same-day bills had no guaranteed order).
+- Tests: `test/madeAt.test.js` (3), server suite 57/57; barcode 53/53, bill-design 60/60, API 133/133 unchanged. Mixed phone + web scenarios: see the mobile repo's TEST_REPORT.md (16/16).
+- Invoices now carry `made_offline`, `offline_ref` (temporary number such as OFFLINE-001) and `synced_at` (additive migration `20261102000000_invoice_made_offline`). `POST /invoices` accepts `made_offline: true` (only the boolean `true` counts) and `offline_ref` (cleaned to letters, digits and `._/-`, 40 characters). Checked live (mobile suite M17-M19): offline bills are marked, web bills are not, dirty or non-boolean values are ignored, a resent bill stays one marked bill.

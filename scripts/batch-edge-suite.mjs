@@ -145,6 +145,11 @@ const qtyOf = async (t, id, batchId) => (await batchesOf(t, id)).find((b) => b.i
   const sentOk = await call('POST', `/invoices/${conv.json.id}/send`, A.token);
   check('now it can be sent, and the batch goes down by 2', sentOk.status === 200 && (await qtyOf(A.token, tracked.id, b1.id)) === before2 - 2, `${sentOk.status} ${JSON.stringify(sentOk.json).slice(0, 160)}`);
 
+  // ── a bill made on a phone without internet (made_offline) keeps its real time and a batch ──
+  const madeAt = new Date(Date.now() - 3 * 3600 * 1000).toISOString();
+  const offBill = await bill(A.token, { customer_id: cust.id, made_offline: true, offline_ref: 'OFFLINE-007', client_created_at: madeAt, items: [line(tracked, 1, 15000, { batch_id: b1.id })] });
+  check('an offline bill is saved with its batch, marked made_offline, with the temporary number and the real time', offBill.status === 201 && offBill.json.made_offline === true && offBill.json.offline_ref === 'OFFLINE-007' && new Date(offBill.json.created_at).toISOString() === madeAt && !!offBill.json.synced_at, JSON.stringify(offBill.json).slice(0, 220));
+
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
 })().catch((e) => { console.error(e); process.exit(1); });
