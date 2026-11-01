@@ -238,6 +238,9 @@ router.put('/:id', async (req, res) => {
     const turningOn = med.track_batches === true && !existing.track_batches;
     const updated = await prisma.$transaction(async (tx) => {
       await lockRow(tx, 'product', req.params.id); // serialise with invoices moving stock
+      if (existing.track_batches && stock_quantity !== undefined && Number(stock_quantity) !== existing.stock_quantity) {
+        throw new HttpError(400, 'Stock of a batch item changes through its batches (add stock or adjust a batch), so that the batches and the total always agree', 'VALIDATION');
+      }
       if (med.track_batches === false && existing.track_batches) {
         throw new HttpError(400, 'Batch tracking cannot be turned off once it is on (it would lose the stock per batch)', 'VALIDATION');
       }

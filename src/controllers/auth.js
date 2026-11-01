@@ -53,6 +53,12 @@ function formatBusinessResponse(business, activeFY) {
     default_due_days: business.default_due_days,
     default_notes: business.default_notes,
     default_terms: business.default_terms,
+    business_type: business.business_type,
+    drug_license_20: business.drug_license_20,
+    drug_license_21: business.drug_license_21,
+    fssai_no: business.fssai_no,
+    rates_include_gst: business.rates_include_gst,
+    near_expiry_days: business.near_expiry_days,
     subscription: business.subscription
       ? { plan: business.subscription.plan, status: business.subscription.status }
       : { plan: 'free', status: 'active' },
