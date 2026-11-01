@@ -115,6 +115,65 @@ router.get('/', async (req, res) => {
 });
 
 // GET /api/products/:id
+// ── Moving existing items to batch tracking ─────────────────────────────────────
+// GET  /api/products/batch-migration   what would change (nothing is changed)
+// POST /api/products/batch-migration   { only_with_stock?, product_ids? }  turn batch tracking on for the items that do not have it yet.
+// Each item's current stock becomes one "OPENING" batch (MRP and cost taken from the item), so the batches add up to the stock the
+// item already had. Owner only. Running it again only touches items that are still untracked.
+const untrackedWhere = (businessId, { onlyWithStock, ids } = {}) => ({
+  business_id: businessId, is_deleted: false, track_batches: false,
+  ...(onlyWithStock ? { stock_quantity: { not: 0 } } : {}),
+  ...(ids ? { id: { in: ids } } : {}),
+});
+
+router.get('/batch-migration', requireRole('owner'), async (req, res) => {
+  try {
+    const businessId = req.user.businessId;
+    const onlyWithStock = req.query.only_with_stock === '1';
+    const where = untrackedWhere(businessId, { onlyWithStock });
+    const [total, withStock, tracked, sample] = await Promise.all([
+      prisma.product.count({ where }),
+      prisma.product.count({ where: { ...where, stock_quantity: { not: 0 } } }),
+      prisma.product.count({ where: { business_id: businessId, is_deleted: false, track_batches: true } }),
+      prisma.product.findMany({ where, orderBy: { name: 'asc' }, take: 10, select: { id: true, name: true, unit: true, stock_quantity: true, mrp: true, purchase_price: true, sale_price: true } }),
+    ]);
+    const agg = await prisma.product.aggregate({ where: { ...where, stock_quantity: { gt: 0 } }, _sum: { stock_quantity: true } });
+    return res.json({ items_to_move: total, items_with_stock: withStock, already_tracking: tracked, stock_units: agg._sum.stock_quantity || 0, sample });
+  } catch (err) {
+    console.error('Batch migration preview error:', err);
+    return res.status(500).json({ error: 'Failed to check the items' });
+  }
+});
+
+router.post('/batch-migration', requireRole('owner'), async (req, res) => {
+  try {
+    const businessId = req.user.businessId;
+    const body = req.body || {};
+    const ids = Array.isArray(body.product_ids) ? body.product_ids.filter((x) => typeof x === 'string' && /^[A-Za-z0-9_-]{1,40}$/.test(x)).slice(0, 5000) : undefined;
+    if (Array.isArray(body.product_ids) && !ids.length) return res.status(400).json({ error: 'No valid items were chosen', code: 'VALIDATION' });
+    const todo = await prisma.product.findMany({ where: untrackedWhere(businessId, { onlyWithStock: body.only_with_stock === true, ids }), select: { id: true }, orderBy: { name: 'asc' } });
+    let converted = 0; let batches = 0; let units = 0; let skipped = 0;
+    for (const { id } of todo) {
+      // one item at a time, so billing is only held up for a moment and a failure leaves the others done
+      // eslint-disable-next-line no-await-in-loop
+      await prisma.$transaction(async (tx) => {
+        await lockRow(tx, 'product', id);
+        const p = await tx.product.findFirst({ where: { id, business_id: businessId, is_deleted: false } });
+        if (!p || p.track_batches) { skipped += 1; return; }
+        const updated = await tx.product.update({ where: { id }, data: { track_batches: true, track_inventory: true } });
+        if (updated.stock_quantity !== 0) { await tx.batch.create({ data: openingBatch(businessId, updated) }); batches += 1; if (updated.stock_quantity > 0) units += updated.stock_quantity; }
+        converted += 1;
+      }, { timeout: 15000 });
+    }
+    console.info(`[audit] batch migration: ${converted} items moved by user ${req.user.userId}`);
+    return res.json({ converted, skipped, opening_batches_created: batches, stock_units: units });
+  } catch (err) {
+    if (err instanceof HttpError) return res.status(err.status).json({ error: err.message, code: err.code });
+    console.error('Batch migration error:', err);
+    return res.status(500).json({ error: 'The move stopped part-way. Items already moved stay moved; run it again for the rest.' });
+  }
+});
+
 router.get('/:id', async (req, res) => {
   try {
     const businessId = req.user.businessId;
