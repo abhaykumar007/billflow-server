@@ -329,7 +329,7 @@ router.get('/:id', async (req, res) => {
         supplier: true,
         items: {
           include: {
-            product: { select: { id: true, name: true, unit: true } },
+            product: { select: { id: true, name: true, unit: true, track_batches: true } },
           },
           orderBy: { created_at: 'asc' },
         },

@@ -150,6 +150,16 @@ const qtyOf = async (t, id, batchId) => (await batchesOf(t, id)).find((b) => b.i
   const offBill = await bill(A.token, { customer_id: cust.id, made_offline: true, offline_ref: 'OFFLINE-007', client_created_at: madeAt, items: [line(tracked, 1, 15000, { batch_id: b1.id })] });
   check('an offline bill is saved with its batch, marked made_offline, with the temporary number and the real time', offBill.status === 201 && offBill.json.made_offline === true && offBill.json.offline_ref === 'OFFLINE-007' && new Date(offBill.json.created_at).toISOString() === madeAt && !!offBill.json.synced_at, JSON.stringify(offBill.json).slice(0, 220));
 
+  // an invoice's lines say whether their item keeps batches, so a draft made from an estimate can show its batch picker
+  const convGet = (await call('GET', `/invoices/${conv.json.id}`, A.token)).json;
+  check('invoice lines carry product.track_batches (true for a batch item)', convGet.items?.[0]?.product?.track_batches === true, JSON.stringify(convGet.items?.[0]?.product));
+  const staffEmail2 = `be.staff.${stamp}@example.com`;
+  await call('POST', '/settings/users/invite', A.token, { name: 'Staffer', email: staffEmail2, password: 'Passw0rd!23', role: 'staff' });
+  const staffTok = (await call('POST', '/auth/login', null, { email: staffEmail2, password: 'Passw0rd!23' })).json.accessToken;
+  const expiredNow = await call('POST', `/products/${tracked.id}/batches`, A.token, { batch_no: 'OLD-S', expiry_date: day(-2), mrp: 20000, purchase_price: 8000, quantity: 3 });
+  const staffSale = await bill(staffTok, { customer_id: cust.id, items: [line(tracked, 1, 15000, { batch_id: expiredNow.json.id, expired_override_reason: 'staff tries' })] });
+  check('staff cannot sell an expired batch, even naming a reason (422 EXPIRED_BATCH)', staffSale.status === 422 && staffSale.json.code === 'EXPIRED_BATCH', `${staffSale.status} ${JSON.stringify(staffSale.json)}`);
+
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
 })().catch((e) => { console.error(e); process.exit(1); });
