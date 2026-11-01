@@ -1696,17 +1696,25 @@ router.get('/all-parties', async (req, res) => {
           invoices: { where: { is_deleted: false, voucher_type: 'PURCHASE', status: { notIn: ['draft', 'cancelled'] } }, select: { total_amount: true, amount_paid: true, balance_due: true } } },
       }),
     ]);
-    const mapParty = (p) => {
+    // The balance is the ledger balance (opening balance, bills, payments), the same figure as the party and ledger screens.
+    const fyWhere = req.financialYear ? { financial_year_id: req.financialYear.id } : {};
+    const [custLedger, supLedger] = await Promise.all([
+      prisma.ledgerEntry.groupBy({ by: ['customer_id'], where: { business_id: businessId, ...fyWhere }, _sum: { debit: true, credit: true } }),
+      prisma.supplierLedgerEntry.groupBy({ by: ['supplier_id'], where: { business_id: businessId, ...fyWhere }, _sum: { debit: true, credit: true } }),
+    ]);
+    const custBal = new Map(custLedger.map((t) => [t.customer_id, (t._sum.debit || 0) - (t._sum.credit || 0)]));
+    const supBal = new Map(supLedger.map((t) => [t.supplier_id, (t._sum.credit || 0) - (t._sum.debit || 0)]));
+    const mapParty = (balances) => (p) => {
       const total_invoiced = p.invoices.reduce((s, i) => s + i.total_amount, 0);
       const total_paid = p.invoices.reduce((s, i) => s + i.amount_paid, 0);
-      return { id: p.id, name: p.name, phone: p.phone || '', gstin: p.gstin || '', total_invoiced, total_paid, balance: p.invoices.reduce((s, i) => s + i.balance_due, 0) };
+      return { id: p.id, name: p.name, phone: p.phone || '', gstin: p.gstin || '', total_invoiced, total_paid, balance: balances.get(p.id) || 0 };
     };
-    const customerList = customers.map(mapParty).sort((a, b) => b.balance - a.balance);
-    const supplierList = suppliers.map(mapParty).sort((a, b) => b.balance - a.balance);
+    const customerList = customers.map(mapParty(custBal)).sort((a, b) => b.balance - a.balance);
+    const supplierList = suppliers.map(mapParty(supBal)).sort((a, b) => b.balance - a.balance);
     res.json({
       customers: customerList, suppliers: supplierList,
-      total_receivable: customerList.reduce((s, c) => s + c.balance, 0),
-      total_payable: supplierList.reduce((s, c) => s + c.balance, 0),
+      total_receivable: customerList.reduce((s, c) => s + Math.max(0, c.balance), 0),
+      total_payable: supplierList.reduce((s, c) => s + Math.max(0, c.balance), 0),
     });
   } catch (err) {
     console.error('All parties error:', err);

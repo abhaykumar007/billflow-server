@@ -27,13 +27,11 @@ router.get('/summary', attachFinancialYear, async (req, res) => {
       todaySalesResult,
       todayPurchasesResult,
       invoicesTodayCount,
-      outstandingResult,
-      totalPayableResult,
       monthCollectedResult,
       openEstimatesCount,
       recentInvoices,
-      topCustomers,
-      topSuppliers,
+      customerLedger,
+      supplierLedger,
       overdueResult,
       lowStockRows,
     ] = await Promise.all([
@@ -70,18 +68,6 @@ router.get('/summary', attachFinancialYear, async (req, res) => {
           status: { not: 'cancelled' },
           is_deleted: false,
         },
-      }),
-
-      // Total outstanding receivable (SALE balance due)
-      prisma.invoice.aggregate({
-        where: openSale,
-        _sum: { balance_due: true },
-      }),
-
-      // Total payable to suppliers (PURCHASE balance due)
-      prisma.invoice.aggregate({
-        where: openPurchase,
-        _sum: { balance_due: true },
       }),
 
       // Total received this month (customer payments)
@@ -125,23 +111,10 @@ router.get('/summary', attachFinancialYear, async (req, res) => {
         },
       }),
 
-      // Top 5 customers by outstanding balance
-      prisma.invoice.groupBy({
-        by: ['customer_id'],
-        where: openSale,
-        _sum: { balance_due: true },
-        orderBy: { _sum: { balance_due: 'desc' } },
-        take: 5,
-      }),
-
-      // Top 5 suppliers by outstanding payable
-      prisma.invoice.groupBy({
-        by: ['supplier_id'],
-        where: openPurchase,
-        _sum: { balance_due: true },
-        orderBy: { _sum: { balance_due: 'desc' } },
-        take: 5,
-      }),
+      // What each customer owes and what we owe each supplier: the ledger balance, so the opening balance is in it and
+      // the figures agree with the Customer / Supplier ledger screens.
+      prisma.ledgerEntry.groupBy({ by: ['customer_id'], where: { business_id: businessId, ...fyFilter }, _sum: { debit: true, credit: true } }),
+      prisma.supplierLedgerEntry.groupBy({ by: ['supplier_id'], where: { business_id: businessId, ...fyFilter }, _sum: { debit: true, credit: true } }),
 
       // Overdue receivables (due date before today)
       prisma.invoice.aggregate({
@@ -156,6 +129,12 @@ router.get('/summary', attachFinancialYear, async (req, res) => {
         select: { stock_quantity: true, low_stock_alert: true },
       }),
     ]);
+
+    const owedBy = customerLedger.map((r) => ({ customer_id: r.customer_id, _sum: { balance_due: (r._sum.debit || 0) - (r._sum.credit || 0) } })).filter((r) => r.customer_id && r._sum.balance_due > 0);
+    const owedTo = supplierLedger.map((r) => ({ supplier_id: r.supplier_id, _sum: { balance_due: (r._sum.credit || 0) - (r._sum.debit || 0) } })).filter((r) => r.supplier_id && r._sum.balance_due > 0);
+    const byDue = (a, b) => b._sum.balance_due - a._sum.balance_due;
+    const topCustomers = [...owedBy].sort(byDue).slice(0, 5);
+    const topSuppliers = [...owedTo].sort(byDue).slice(0, 5);
 
     // Enrich top customers and suppliers with names in parallel
     const customerIds = topCustomers.map((c) => c.customer_id).filter(Boolean);
@@ -187,8 +166,8 @@ router.get('/summary', attachFinancialYear, async (req, res) => {
       todaySales: todaySalesResult._sum.total_amount || 0,
       todayPurchases: todayPurchasesResult._sum.total_amount || 0,
       invoicesToday: invoicesTodayCount,
-      totalOutstanding: outstandingResult._sum.balance_due || 0,
-      totalPayable: totalPayableResult._sum.balance_due || 0,
+      totalOutstanding: owedBy.reduce((s, r) => s + r._sum.balance_due, 0),
+      totalPayable: owedTo.reduce((s, r) => s + r._sum.balance_due, 0),
       monthCollected: monthCollectedResult._sum.amount || 0,
       openEstimates: openEstimatesCount,
       overdueCount: overdueResult._count.id || 0,
