@@ -618,7 +618,12 @@ router.post('/:id/send', async (req, res) => {
     if (fy) assertDateInFY(invoice.invoice_date, fy);
     // a draft made from an estimate may still need its batches chosen; the same checks as when typing the bill (on copies of the lines)
     const business = await tx.business.findUnique({ where: { id: businessId }, select: { rates_include_gst: true, business_type: true } });
-    await validateBatchLines(tx, { businessId, business, user: req.user, voucher_type: invoice.voucher_type, lines: invoice.items.map((i) => ({ ...i })) });
+    try {
+      await validateBatchLines(tx, { businessId, business, user: req.user, voucher_type: invoice.voucher_type, lines: invoice.items.map((i) => ({ ...i })) });
+    } catch (err) {
+      // expired stock is judged by postVoucher below (with its own message); only a missing batch is handled here
+      if (!(err instanceof HttpError && ['EXPIRED_BATCH', 'EXPIRED_BATCH_REASON_REQUIRED'].includes(err.code))) throw err;
+    }
     const warnings = await postVoucher(tx, invoice, invoice.items, { fyId: invoice.financial_year_id, entryDate: invoice.invoice_date });
     return { invoice, warnings };
   });

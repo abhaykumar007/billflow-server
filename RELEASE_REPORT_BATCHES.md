@@ -31,8 +31,9 @@ fast-forward. The mobile app is not part of this release (see "Not in this relea
 | Suite | Result |
 |---|---|
 | Server unit tests | 71 / 71 |
+| (found while doing the phone app) estimate → sale lost "rates include GST" and batch details; now kept, and a draft that still needs a batch cannot be sent. Covered by 6 new edge checks. | fixed |
 | `scripts/batch-suite.mjs` (batches, expiry, MRP, GST-inclusive, concurrency) | 92 / 92 |
-| `scripts/batch-edge-suite.mjs` (bad input, other business, returns, cancels, drafts) | 40 / 40 |
+| `scripts/batch-edge-suite.mjs` (bad input, other business, returns, cancels, drafts, estimate convert) | 46 / 46 |
 | `scripts/batch-report-suite.mjs` (reports against hand-worked figures) | 63 / 63 |
 | `scripts/import-suite.mjs` (import, duplicates, reference number, permissions) | 58 / 58 |
 | `scripts/bill-design-suite.mjs` (existing + new bill layout) | 60 / 60 |
@@ -47,8 +48,8 @@ PDF generation; Excel import with real `.xlsx` files (purchase and sale); duplic
 
 ## Known limits and things to know before deploying
 
-1. **Phone app is not updated.** A batch-tracked item cannot be sold from the current phone app (the server answers "Choose a batch"). Items that do not track batches, and every other phone feature, are unaffected. Batch tracking is opt-in per item, so nothing changes for a shop until it turns it on. Do not turn batch tracking on for items that are sold from phones until phase 6 ships.
-2. **Offline mode** (`offline-system` branches) is not merged and will conflict with this work in `invoices.js` and `schema.prisma`; it needs a merge and a batch-aware sync before it goes to main.
+1. **Phone app** (branch `batches-phone` in `billflow-mobile`, from `main`, merges cleanly): sale batch picker, purchase batch/expiry/MRP/free qty/selling price, supplier bill no., expired-stock reason (owner) / block (staff), MRP warning, GST-inclusive rates and totals, batch details on the bill screen, MRP + batch switch on the item form, six batch/sale reports. Checked by TypeScript, a full Android JS bundle export, and 4,000 random bills whose totals match the server in both pricing modes. **It has not been run on a phone**, because that needs a new APK and APK builds are only done when you ask. Until a build is tested on a phone, do not turn batch tracking on for items sold from phones; the older installed app cannot sell batch items (the server answers "Choose a batch").
+2. **Offline mode** (`offline-system` branches) is not merged. `batches-phone` merges with it without conflicts, but the offline layer is not batch-aware (its totals ignore GST-inclusive pricing and it cannot pick batches without a connection). Before it goes to main, offline billing must be blocked or taught for batch items and for GST-inclusive shops. The server branch will conflict in `invoices.js` and `schema.prisma` when merged.
 3. **Not tried on a real printer.** The bill layouts were checked on screen and as PDF.
 4. **Not rehearsed on a copy of production data.** The migrations are additive and were applied to a database that had real-shaped data (built on `main`'s schema) and to an empty database; the Neon copy of production was not touched.
 5. **Excel import limits:** `.xlsx` only, first sheet, 8 MB / 20,000 lines per file, purchase and sale bills only (no returns).
