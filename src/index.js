@@ -17,6 +17,7 @@ const suppliersRoutes = require('./routes/suppliers');
 const productsRoutes = require('./routes/products');
 const productBarcodeRoutes = require('./routes/productBarcodes');
 const batchRoutes = require('./routes/batches');
+const batchReportRoutes = require('./routes/batchReports');
 const productCategoriesRoutes = require('./routes/product-categories');
 const invoicesRoutes = require('./routes/invoices');
 const paymentsRoutes = require('./routes/payments');
@@ -75,6 +76,7 @@ app.use('/api/expenses', expensesRoutes);
 app.use('/api/bank-accounts', bankAccountsRoutes);
 app.use('/api/fund-transfers', fundTransfersRoutes);
 app.use('/api/ledger', ledgerRoutes);
+app.use('/api/reports', batchReportRoutes);
 app.use('/api/reports', reportsRoutes);
 app.use('/api/subscriptions', subscriptionsRoutes);
 
