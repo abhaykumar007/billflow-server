@@ -128,6 +128,23 @@ const qtyOf = async (t, id, batchId) => (await batchesOf(t, id)).find((b) => b.i
   const bad = await sale([line(plain, 1, 15000), line(tracked, 1, 15000)]);
   check('a failing line rolls the whole bill back (plain item stock unchanged)', bad.status === 400 && (await stockOf(A.token, plain.id)) === 8);
 
+  // ── estimate -> sale keeps the pricing mode and needs a batch before it can be sent ──
+  await call('PUT', '/settings/industry', A.token, { rates_include_gst: true });
+  const estB = await bill(A.token, { voucher_type: 'ESTIMATE', status: 'sent', customer_id: cust.id, items: [line(tracked, 2, 11800, { tax_rate: 12 })] });
+  check('estimate (GST-inclusive) with a batch item needs no batch', estB.status === 201 && estB.json.rates_include_gst === true && estB.json.total_amount === 23600, `${estB.status} ${JSON.stringify(estB.json).slice(0, 160)}`);
+  await call('PUT', '/settings/industry', A.token, { rates_include_gst: false });
+  const conv = await call('POST', `/invoices/${estB.json.id}/convert`, A.token, {});
+  check('converting keeps "rates include GST" and the same total (236.00)', conv.status === 201 && conv.json.rates_include_gst === true && conv.json.total_amount === 23600 && conv.json.status === 'draft', `${conv.status} ${JSON.stringify(conv.json).slice(0, 160)}`);
+  const sendNoBatch = await call('POST', `/invoices/${conv.json.id}/send`, A.token);
+  check('sending the converted draft without a batch is refused (BATCH_REQUIRED) and nothing moves', sendNoBatch.status === 400 && sendNoBatch.json.code === 'BATCH_REQUIRED', `${sendNoBatch.status} ${JSON.stringify(sendNoBatch.json)}`);
+  const stillDraft = (await call('GET', `/invoices/${conv.json.id}`, A.token)).json;
+  check('...and it is still a draft', stillDraft.status === 'draft');
+  const picked = await call('PUT', `/invoices/${conv.json.id}`, A.token, { customer_id: cust.id, invoice_date: day(0), items: [line(tracked, 2, 11800, { tax_rate: 12, batch_id: b1.id })] });
+  check('picking the batch on the draft keeps the inclusive total (236.00)', picked.status === 200 && picked.json.total_amount === 23600 && picked.json.rates_include_gst === true, `${picked.status} ${JSON.stringify(picked.json).slice(0, 160)}`);
+  const before2 = await qtyOf(A.token, tracked.id, b1.id);
+  const sentOk = await call('POST', `/invoices/${conv.json.id}/send`, A.token);
+  check('now it can be sent, and the batch goes down by 2', sentOk.status === 200 && (await qtyOf(A.token, tracked.id, b1.id)) === before2 - 2, `${sentOk.status} ${JSON.stringify(sentOk.json).slice(0, 160)}`);
+
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
 })().catch((e) => { console.error(e); process.exit(1); });
