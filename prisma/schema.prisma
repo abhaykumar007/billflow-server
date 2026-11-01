@@ -196,7 +196,7 @@ model Supplier {
   business        Business              @relation(fields: [business_id], references: [id])
   ledgerEntries   SupplierLedgerEntry[]
 
-  @@index([business_id, is_deleted])
+  @@index([business_id, is_deleted])
   batches          Batch[]
 }
 
@@ -362,6 +362,7 @@ model InvoiceItem {
 
   @@index([invoice_id])
   @@index([product_id])
+  @@index([batch_id])
 }
 
 model Payment {
