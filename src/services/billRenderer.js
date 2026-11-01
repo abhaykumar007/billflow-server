@@ -188,6 +188,13 @@ function licenceLines(business, h, narrow = false) {
   ].filter(Boolean);
 }
 
+// The number the bill came with (a supplier's own bill number): shown when the design allows it
+function refLine(ctx) {
+  const { invoice, design, isPurchase } = ctx;
+  if (!design.extras.reference || !invoice.external_ref) return '';
+  return `<p class="gray">${isPurchase ? 'Supplier bill no' : 'Ref'}: ${esc(invoice.external_ref)}</p>`;
+}
+
 function headerHtml(ctx) {
   const { design, business, invoice, labels, title, logoSrc } = ctx;
   const h = design.header;
@@ -202,7 +209,7 @@ function headerHtml(ctx) {
     h.email && business.email ? `<p class="gray">${esc(business.email)}</p>` : '',
   ].join('');
   return `<div class="hdr"><div class="biz ${h.logo_position === 'right' ? 'right' : ''}">${logo}<div>${lines}</div></div>
-<div class="doc"><p class="doc-title">${esc(title)}</p><p class="doc-no">${esc(invoice.invoice_number)}</p><p class="gray">Date: ${fmtDate(invoice.invoice_date)}</p>${invoice.valid_until && invoice.voucher_type === 'ESTIMATE' ? `<p class="gray">Valid until: ${fmtDate(invoice.valid_until)}</p>` : ''}${invoice.due_date && invoice.voucher_type !== 'ESTIMATE' ? `<p class="due">Due: ${fmtDate(invoice.due_date)}</p>` : ''}</div></div>`;
+<div class="doc"><p class="doc-title">${esc(title)}</p><p class="doc-no">${esc(invoice.invoice_number)}</p>${refLine(ctx)}<p class="gray">Date: ${fmtDate(invoice.invoice_date)}</p>${invoice.valid_until && invoice.voucher_type === 'ESTIMATE' ? `<p class="gray">Valid until: ${fmtDate(invoice.valid_until)}</p>` : ''}${invoice.due_date && invoice.voucher_type !== 'ESTIMATE' ? `<p class="due">Due: ${fmtDate(invoice.due_date)}</p>` : ''}</div></div>`;
 }
 
 function partyHtml(ctx) {
@@ -274,7 +281,7 @@ function renderThermal(ctx) {
   return `<div class="center">${logo}${h.name ? `<p style="font-weight:bold;font-size:1.2em">${esc(business.name)}</p>` : ''}${h.address && addr ? `<p class="gray">${esc(addr)}</p>` : ''}${h.gstin && business.gstin ? `<p class="gray">GSTIN: ${esc(business.gstin)}</p>` : ''}${licenceLines(business, h, true).map((l) => `<p class="gray">${esc(l)}</p>`).join('')}${h.phone && business.phone ? `<p class="gray">Ph: ${esc(business.phone)}</p>` : ''}</div>
 <div class="dash"></div>
 <div class="center"><p style="font-weight:bold;text-transform:uppercase">${esc(title)}</p></div>
-<div class="t-row"><span>${esc(invoice.invoice_number)}</span><span>${fmtDate(invoice.invoice_date)}</span></div>
+<div class="t-row"><span>${esc(invoice.invoice_number)}</span><span>${fmtDate(invoice.invoice_date)}</span></div>${refLine(ctx)}
 ${party ? `<div>${esc(party.name)}${design.party.phone && party.phone ? ` · ${esc(party.phone)}` : ''}</div>${design.party.gstin && party.gstin ? `<div class="gray">GSTIN: ${esc(party.gstin)}</div>` : ''}` : ''}
 <div class="dash"></div>${items}<div class="dash"></div>
 ${totalsHtml(ctx)}

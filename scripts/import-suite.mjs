@@ -161,6 +161,31 @@ const findProduct = async (t, name) => ((await call('GET', `/products?search=${e
   x = await imp(F.token, { type: 'PURCHASE', dry_run: true, options: flags, bills: [purchase1] });
   check('another business is never told about my bills (no duplicate there)', x.json.results[0].status === 'ok');
 
+  // ── reference number on typed bills, the bill and the print ───────────────
+  const sup2 = (await call('POST', '/suppliers', A.token, { name: nm('RefSupp'), state: 'Karnataka' })).json;
+  const sup3 = (await call('POST', '/suppliers', A.token, { name: nm('RefSupp'), state: 'Karnataka' })).json;
+  const refLines = [{ product_id: prod1.id, description: prod1.name, quantity: 1, unit: 'pcs', rate: 8000, tax_rate: 12, batch_no: 'RF1', mrp: 12000, expiry_date: day(300) }];
+  const typed = (supplier, ref, extra = {}) => call('POST', '/invoices', A.token, { voucher_type: 'PURCHASE', status: 'sent', supplier_id: supplier.id, invoice_date: day(0), external_ref: ref, items: refLines, ...extra }, { 'Idempotency-Key': `rf-${stamp}-${++n}-${Math.random().toString(36).slice(2)}` });
+  const t1 = await typed(sup2, '  INV 77  ');
+  check('a typed purchase keeps the supplier bill no. (trimmed)', t1.status === 201 && t1.json.external_ref === 'INV 77', JSON.stringify(t1.json).slice(0, 200));
+  const t2 = await typed(sup2, 'inv 77');
+  check('the same supplier bill no. for the same supplier is refused (409 DUPLICATE_REFERENCE)', t2.status === 409 && t2.json.code === 'DUPLICATE_REFERENCE', JSON.stringify(t2.json));
+  check('the same bill no. for another supplier is fine', (await typed(sup3, 'INV 77')).status === 201);
+  check('no bill no. at all is fine (and two such bills are fine)', (await typed(sup2, null)).status === 201 && (await typed(sup2, '')).status === 201);
+  await call('DELETE', `/invoices/${t1.json.id}`, A.token);
+  check('after the first one is cancelled the number can be used again', (await typed(sup2, 'INV 77')).status === 201);
+  const dr = await typed(sup2, 'DRAFT-1', { status: 'draft' });
+  const up = await call('PUT', `/invoices/${dr.json.id}`, A.token, { supplier_id: sup2.id, invoice_date: day(0), external_ref: 'DRAFT-2', items: refLines });
+  check('a draft can have its supplier bill no. changed', up.status === 200 && up.json.external_ref === 'DRAFT-2', JSON.stringify(up.json).slice(0, 200));
+  const up2 = await call('PUT', `/invoices/${dr.json.id}`, A.token, { supplier_id: sup2.id, invoice_date: day(0), items: refLines });
+  check('saving the draft without the field keeps the number', up2.json.external_ref === 'DRAFT-2');
+  const printed = (await call('GET', `/invoices/${dr.json.id}/print`, A.token)).json.html || '';
+  check('the printed bill shows "Supplier bill no: DRAFT-2"', /Supplier bill no: DRAFT-2/.test(printed));
+  const dsg = (await call('GET', '/bill-design', A.token)).json.design;
+  await call('PUT', '/bill-design', A.token, { design: { ...dsg, extras: { ...dsg.extras, reference: false } } });
+  const hidden = (await call('GET', `/invoices/${dr.json.id}/print`, A.token)).json.html || '';
+  check('with the design option off the number is not printed', !/Supplier bill no/.test(hidden) && /<p class="doc-no">/.test(hidden));
+
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
 })().catch((e) => { console.error(e); process.exit(1); });

@@ -389,6 +389,19 @@ router.get('/:id/print', async (req, res) => {
 });
 
 // ── POST /api/invoices ────────────────────────────────────────────────────────
+// One bill number per party: the same reference (the supplier's own bill number, or the sheet's) twice is almost always a mistake.
+const cleanRef = (v) => (v ? String(v).trim().replace(/\s+/g, ' ').slice(0, 60) : null);
+async function assertReferenceFree(tx, { businessId, voucher_type, customer_id, supplier_id, ref, excludeId }) {
+  if (!ref) return;
+  const partyWhere = SALE_TYPES.includes(voucher_type) ? { customer_id: customer_id || undefined } : PURCHASE_TYPES.includes(voucher_type) ? { supplier_id: supplier_id || undefined } : null;
+  if (!partyWhere || !Object.values(partyWhere)[0]) return;
+  const dup = await tx.invoice.findFirst({
+    where: { business_id: businessId, voucher_type, is_deleted: false, status: { not: 'cancelled' }, external_ref: { equals: ref, mode: 'insensitive' }, ...partyWhere, ...(excludeId ? { id: { not: excludeId } } : {}) },
+    select: { invoice_number: true },
+  });
+  if (dup) throw new HttpError(409, `Bill number ${ref} is already entered for this party (${dup.invoice_number})`, 'DUPLICATE_REFERENCE', { invoice_number: dup.invoice_number });
+}
+
 // Thrown inside the transaction of a dry run, to roll everything back while still handing the result out
 class DryRunDone extends Error { constructor(result) { super('dry run'); this.result = result; } }
 
@@ -463,6 +476,7 @@ async function createInvoiceCore({ user, fy, body, key = null, prepare = null, d
         }
       }
 
+      await assertReferenceFree(tx, { businessId, voucher_type, customer_id, supplier_id, ref: cleanRef(external_ref) });
       const generated = await allocateInvoiceNumber(tx, voucher_type, fy, businessId);
       const finalNumber = providedNumber ? String(providedNumber).trim().slice(0, 40) : generated;
 
@@ -489,7 +503,7 @@ async function createInvoiceCore({ user, fy, body, key = null, prepare = null, d
           balance_due: totals.total_amount,
           notes: notes ? String(notes).slice(0, 2000) : null,
           terms: terms ? String(terms).slice(0, 2000) : null,
-          external_ref: external_ref ? String(external_ref).trim().slice(0, 60) : null,
+          external_ref: cleanRef(external_ref),
           created_by: user.userId,
           idempotency_key: key,
           items: { create: totals.lines },
@@ -527,6 +541,8 @@ router.put('/:id', async (req, res) => {
   if (existing.status !== 'draft') throw new HttpError(400, 'Only draft invoices can be edited', 'VALIDATION');
 
   const { customer_id, supplier_id, discount_amount = 0, items, notes, terms } = req.body;
+  const refGiven = 'external_ref' in req.body;
+  const newRef = refGiven ? cleanRef(req.body.external_ref) : undefined;
   const dates = fy ? parseDates({
     invoice_date: req.body.invoice_date || existing.invoice_date.toISOString().slice(0, 10),
     due_date: req.body.due_date,
@@ -568,6 +584,7 @@ router.put('/:id', async (req, res) => {
         balance_due: totals.total_amount - existing.amount_paid,
         notes: notes ? String(notes).slice(0, 2000) : null,
         terms: terms ? String(terms).slice(0, 2000) : null,
+        ...(refGiven ? { external_ref: newRef } : {}),
         items: { create: totals.lines },
       },
       include: { customer: true, supplier: true, items: true },

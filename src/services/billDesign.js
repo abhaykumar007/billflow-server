@@ -47,7 +47,7 @@ const DEFAULT_DESIGN = {
   columns: { serial: true, hsn: false, unit: true, rate: true, discount: true, tax_rate: true, batch: false, expiry: false, mrp: false, free: true },
   labels: { ...DEFAULT_LABELS },
   totals: { amount_in_words: true, tax_breakup: true, payments: true },
-  extras: { bank: false, bank_account_id: null, upi_qr: false, upi_with_amount: true, signature: true, signatory_text: 'Authorised Signatory', notes: true, terms: true, footer_text: '', computer_generated: true, paid_stamp: true },
+  extras: { bank: false, bank_account_id: null, upi_qr: false, upi_with_amount: true, signature: true, signatory_text: 'Authorised Signatory', notes: true, terms: true, footer_text: '', computer_generated: true, paid_stamp: true, reference: true },
 };
 
 // Fields a GST tax invoice must carry. They cannot be switched off for a GST-registered business.
@@ -113,7 +113,7 @@ function sanitizeDesign(input, business) {
       upi_qr: bool(x.upi_qr, false), upi_with_amount: bool(x.upi_with_amount, true),
       signature: bool(x.signature, true), signatory_text: text(x.signatory_text, 60, D.extras.signatory_text),
       notes: bool(x.notes, true), terms: bool(x.terms, true), footer_text: text(x.footer_text, 200, ''),
-      computer_generated: bool(x.computer_generated, true), paid_stamp: bool(x.paid_stamp, true),
+      computer_generated: bool(x.computer_generated, true), paid_stamp: bool(x.paid_stamp, true), reference: bool(x.reference, true),
     },
   };
   return enforceRequired(out, business);

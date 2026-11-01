@@ -348,3 +348,20 @@ test('bill: receipts print each licence on its own line; A5 keeps batch, expiry 
   const a5 = await renderBill({ invoice: sampleInvoice(b), business: b, design: null, paper: 'a5' });
   assert.match(a5, /<td class="nw" style="text-align:left">[A-Z0-9]+<\/td><td class="nw" style="text-align:left">\w{3} \d{2}<\/td>/);
 });
+
+test('bill: the supplier bill no. prints on purchase bills (and as Ref on others), and the design can switch it off', async () => {
+  const purchase = { ...sampleInvoice(biz()), voucher_type: 'PURCHASE', external_ref: 'SUP-1001<b>' };
+  const on = await renderBill({ invoice: purchase, business: biz(), design: null });
+  assert.match(on, /Supplier bill no: SUP-1001&lt;b&gt;/);
+  assert.doesNotMatch(on, /SUP-1001<b>/);
+  const sale = await renderBill({ invoice: { ...sampleInvoice(biz()), external_ref: 'X-9' }, business: biz(), design: null });
+  assert.match(sale, /Ref: X-9/);
+  const off = await renderBill({ invoice: purchase, business: biz(), design: { extras: { reference: false } } });
+  assert.doesNotMatch(off, /Supplier bill no/);
+  const receipt = await renderBill({ invoice: purchase, business: biz(), design: null, paper: 't80' });
+  assert.match(receipt, /Supplier bill no: SUP-1001/);
+  const none = await renderBill({ invoice: { ...sampleInvoice(biz()), voucher_type: 'PURCHASE' }, business: biz(), design: null });
+  assert.doesNotMatch(none, /Supplier bill no/);
+  assert.equal(sanitizeDesign({}, biz()).extras.reference, true);
+  assert.equal(sanitizeDesign({ extras: { reference: false } }, biz()).extras.reference, false);
+});
