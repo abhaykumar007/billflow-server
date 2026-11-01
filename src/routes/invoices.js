@@ -422,7 +422,7 @@ router.post('/', attachFinancialYear, enforceOpenYear, requireUnlockedFY, checkI
   const businessId = req.user.businessId;
   const {
     voucher_type = 'SALE', customer_id, supplier_id, linked_invoice_id,
-    invoice_number: providedNumber, status = 'draft', items, discount_amount = 0, notes, terms, client_created_at,
+    invoice_number: providedNumber, status = 'draft', items, discount_amount = 0, notes, terms, client_created_at, made_offline, offline_ref,
   } = req.body;
   const fy = req.financialYear;
 
@@ -500,6 +500,7 @@ router.post('/', attachFinancialYear, enforceOpenYear, requireUnlockedFY, checkI
         created_by: req.user.userId,
         idempotency_key: key,
         ...(parseMadeAt(client_created_at) ? { created_at: parseMadeAt(client_created_at) } : {}),
+        ...(made_offline === true ? { made_offline: true, synced_at: new Date(), offline_ref: typeof offline_ref === 'string' ? offline_ref.replace(/[^A-Za-z0-9._/-]/g, '').slice(0, 40) || null : null } : {}),
         items: { create: totals.lines },
       },
       include: { customer: true, supplier: true, items: true },

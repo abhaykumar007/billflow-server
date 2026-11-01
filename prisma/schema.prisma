@@ -273,6 +273,9 @@ model ProductBarcode {
 model Invoice {
   id                String         @id @default(cuid())
   business_id       String
+  made_offline      Boolean        @default(false) // made on a phone without internet, sent later
+  offline_ref       String?        // the temporary number it had on the phone, e.g. OFFLINE-001
+  synced_at         DateTime?      // when it reached the server (created_at is when it was really made)
   customer_id       String?
   invoice_number    String
   invoice_date      DateTime       @default(now())
