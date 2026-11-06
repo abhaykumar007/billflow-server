@@ -404,6 +404,23 @@ async function assertReferenceFree(tx, { businessId, voucher_type, customer_id, 
   if (dup) throw new HttpError(409, `Bill number ${ref} is already entered for this party (${dup.invoice_number})`, 'DUPLICATE_REFERENCE', { invoice_number: dup.invoice_number });
 }
 
+// Credit limit for a SALE: what the customer already owes on open bills plus this bill, against their limit. A hard limit
+// refuses the bill; a soft limit returns a warning. excludeId leaves out a bill that is already counted (finalising a draft).
+async function checkCreditLimit(tx, { businessId, voucher_type, customer, amount, excludeId }) {
+  if (voucher_type !== 'SALE' || !(customer?.credit_limit > 0)) return null;
+  await lockRow(tx, 'customer', customer.id);
+  const agg = await tx.invoice.aggregate({
+    where: { customer_id: customer.id, business_id: businessId, voucher_type: 'SALE', status: { in: ['sent', 'partial'] }, is_deleted: false, ...(excludeId ? { id: { not: excludeId } } : {}) },
+    _sum: { balance_due: true },
+  });
+  const used = agg._sum.balance_due || 0;
+  if (used + amount <= customer.credit_limit) return null;
+  const msg = `Credit limit exceeded. Limit: ₹${(customer.credit_limit / 100).toFixed(2)}, Already used: ₹${(used / 100).toFixed(2)}, This invoice: ₹${(amount / 100).toFixed(2)}.`;
+  const detail = { code: 'CREDIT_LIMIT_EXCEEDED', credit_limit: customer.credit_limit, credit_used: used, invoice_total: amount };
+  if (customer.credit_limit_type === 'hard') throw new HttpError(422, msg, 'CREDIT_LIMIT_EXCEEDED', detail);
+  return { warning: true, message: msg, ...detail };
+}
+
 // Thrown inside the transaction of a dry run, to roll everything back while still handing the result out
 class DryRunDone extends Error { constructor(result) { super('dry run'); this.result = result; } }
 
@@ -462,21 +479,8 @@ async function createInvoiceCore({ user, fy, body, key = null, prepare = null, d
       await validateReturnQuantities(tx, businessId, voucher_type, linked, totals.lines, null);
       mrpWarnings = await validateBatchLines(tx, { businessId, business, user, voucher_type, lines: totals.lines });
 
-      // Credit limit (SALE only)
-      if (voucher_type === 'SALE' && customer?.credit_limit > 0) {
-        await lockRow(tx, 'customer', customer.id);
-        const agg = await tx.invoice.aggregate({
-          where: { customer_id, business_id: businessId, voucher_type: 'SALE', status: { in: ['sent', 'partial'] }, is_deleted: false },
-          _sum: { balance_due: true },
-        });
-        const used = agg._sum.balance_due || 0;
-        if (used + totals.total_amount > customer.credit_limit) {
-          const msg = `Credit limit exceeded. Limit: ₹${(customer.credit_limit / 100).toFixed(2)}, Already used: ₹${(used / 100).toFixed(2)}, This invoice: ₹${(totals.total_amount / 100).toFixed(2)}.`;
-          const detail = { code: 'CREDIT_LIMIT_EXCEEDED', credit_limit: customer.credit_limit, credit_used: used, invoice_total: totals.total_amount };
-          if (customer.credit_limit_type === 'hard') throw new HttpError(422, msg, 'CREDIT_LIMIT_EXCEEDED', detail);
-          creditWarning = { warning: true, message: msg, ...detail };
-        }
-      }
+      // Credit limit (SALE only). A draft is not owed yet, so it is checked when the bill is finalised (here or in /send).
+      if (status !== 'draft') creditWarning = await checkCreditLimit(tx, { businessId, voucher_type, customer, amount: totals.total_amount });
 
       await assertReferenceFree(tx, { businessId, voucher_type, customer_id, supplier_id, ref: cleanRef(external_ref) });
       const generated = await allocateInvoiceNumber(tx, voucher_type, fy, businessId);
@@ -629,11 +633,13 @@ router.post('/:id/send', async (req, res) => {
       // expired stock is judged by postVoucher below (with its own message); only a missing batch is handled here
       if (!(err instanceof HttpError && ['EXPIRED_BATCH', 'EXPIRED_BATCH_REASON_REQUIRED'].includes(err.code))) throw err;
     }
+    const sendCustomer = invoice.customer_id ? await tx.customer.findFirst({ where: { id: invoice.customer_id, business_id: businessId } }) : null;
+    const creditWarning = await checkCreditLimit(tx, { businessId, voucher_type: invoice.voucher_type, customer: sendCustomer, amount: invoice.total_amount, excludeId: invoice.id });
     const warnings = await postVoucher(tx, invoice, invoice.items, { fyId: invoice.financial_year_id, entryDate: invoice.invoice_date });
-    return { invoice, warnings };
+    return { invoice, warnings, creditWarning };
   });
 
-  res.json({ ...result.invoice, ...(result.warnings.length ? { stock_warnings: result.warnings } : {}) });
+  res.json({ ...result.invoice, ...(result.creditWarning || {}), ...(result.warnings.length ? { stock_warnings: result.warnings } : {}) });
 });
 
 // ── POST /api/invoices/:id/convert — convert estimate → SALE invoice ─────────

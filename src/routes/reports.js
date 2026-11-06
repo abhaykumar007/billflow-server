@@ -37,6 +37,21 @@ function parseDateRange(from, to, financialYear = null) {
   return invoiceDateWhere(from, to, financialYear);
 }
 
+// What each party owes / is owed, from the party ledger (opening balances, bills, payments, returns): the same figures as
+// the dashboard, the Balance Sheet and the ledger screens. Positive = the party owes us (customers) or we owe them (suppliers).
+async function ledgerBalances(businessId, fy) {
+  const fyWhere = fy ? { financial_year_id: fy.id } : {};
+  const [cust, sup] = await Promise.all([
+    prisma.ledgerEntry.groupBy({ by: ['customer_id'], where: { business_id: businessId, ...fyWhere }, _sum: { debit: true, credit: true } }),
+    prisma.supplierLedgerEntry.groupBy({ by: ['supplier_id'], where: { business_id: businessId, ...fyWhere }, _sum: { debit: true, credit: true } }),
+  ]);
+  return {
+    customers: new Map(cust.filter((t) => t.customer_id).map((t) => [t.customer_id, (t._sum.debit || 0) - (t._sum.credit || 0)])),
+    suppliers: new Map(sup.filter((t) => t.supplier_id).map((t) => [t.supplier_id, (t._sum.credit || 0) - (t._sum.debit || 0)])),
+  };
+}
+const positiveTotal = (map) => [...map.values()].reduce((s, b) => s + Math.max(0, b), 0);
+
 // GET /api/reports/sales-summary?from=&to=
 router.get('/sales-summary', async (req, res) => {
   const { from, to } = req.query;
@@ -117,7 +132,21 @@ router.get('/outstanding', async (req, res) => {
       else if (overdueDays <= 60) customerMap[cid].overdue_31_60 += inv.balance_due;
       else customerMap[cid].overdue_60_plus += inv.balance_due;
     }
-    const customers = Object.values(customerMap).sort((a, b) => b.total_due - a.total_due);
+    // The total owed is the party ledger balance (so opening balances count, and an advance or return credit reduces it).
+    // `other_due` is the part not on an open bill (opening balance, or credit applied), so the lines still add up.
+    const { customers: owed } = await ledgerBalances(businessId, req.financialYear);
+    const missing = [...owed.keys()].filter((id) => owed.get(id) > 0 && !customerMap[id]);
+    if (missing.length) {
+      const found = await prisma.customer.findMany({ where: { id: { in: missing }, business_id: businessId }, select: { id: true, name: true, phone: true } });
+      for (const c of found) customerMap[c.id] = { customer: c, invoices: [], total_due: 0, current: 0, overdue_1_30: 0, overdue_31_60: 0, overdue_60_plus: 0 };
+    }
+    for (const [cid, row] of Object.entries(customerMap)) {
+      const balance = owed.get(cid);
+      if (balance === undefined) { row.other_due = 0; continue; }   // walk-in bills have no ledger
+      row.other_due = balance - row.total_due;
+      row.total_due = balance;
+    }
+    const customers = Object.values(customerMap).filter((c) => c.total_due > 0).sort((a, b) => b.total_due - a.total_due);
     res.json({ customers, grand_total: customers.reduce((s, c) => s + c.total_due, 0), invoice_count: invoices.length });
   } catch (err) {
     console.error(err);
@@ -245,7 +274,20 @@ router.get('/outstanding-payable', async (req, res) => {
       else if (daysSince <= 90) supplierMap[sid].days_61_90 += inv.balance_due;
       else supplierMap[sid].days_90_plus += inv.balance_due;
     }
-    const suppliers = Object.values(supplierMap).sort((a, b) => b.total_due - a.total_due);
+    // Same rule as the receivable report: the amount owed is the party ledger balance; other_due is the part not on an open bill.
+    const { suppliers: owed } = await ledgerBalances(businessId, req.financialYear);
+    const missing = [...owed.keys()].filter((id) => owed.get(id) > 0 && !supplierMap[id]);
+    if (missing.length) {
+      const found = await prisma.supplier.findMany({ where: { id: { in: missing }, business_id: businessId }, select: { id: true, name: true, phone: true } });
+      for (const s of found) supplierMap[s.id] = { supplier: s, invoices: [], total_due: 0, days_0_30: 0, days_31_60: 0, days_61_90: 0, days_90_plus: 0 };
+    }
+    for (const [sid, row] of Object.entries(supplierMap)) {
+      const balance = owed.get(sid);
+      if (balance === undefined) { row.other_due = 0; continue; }
+      row.other_due = balance - row.total_due;
+      row.total_due = balance;
+    }
+    const suppliers = Object.values(supplierMap).filter((c) => c.total_due > 0).sort((a, b) => b.total_due - a.total_due);
     res.json({ suppliers, grand_total: suppliers.reduce((s, c) => s + c.total_due, 0), invoice_count: invoices.length });
   } catch (err) {
     console.error(err);
@@ -434,12 +476,15 @@ router.get('/stock-summary', async (req, res) => {
   const fy = req.financialYear;
 
   try {
+    // Closing quantity and value are the live stock (the same figures as Products and the Balance Sheet); the opening,
+    // purchased and sold columns show this financial year's movement.
     const products = await prisma.product.findMany({
-      where: { business_id: businessId, is_deleted: false, is_active: true },
+      where: { business_id: businessId, is_deleted: false, is_active: true, track_inventory: true },
       select: {
         id: true,
         name: true,
         unit: true,
+        stock_quantity: true,
         purchase_price: true,
         category: { select: { name: true } },
       },
@@ -497,8 +542,8 @@ router.get('/stock-summary', async (req, res) => {
       const purchase_return  = purchaseRetMap[p.id]  || 0;
       const sold_qty         = soldMap[p.id]         || 0;
       const sale_return_qty  = saleRetMap[p.id]      || 0;
-      const closing_qty      = opening_qty + purchased_qty - purchase_return - sold_qty + sale_return_qty;
-      const stock_value      = closing_qty * (p.purchase_price || 0);
+      const closing_qty      = p.stock_quantity || 0;
+      const stock_value      = Math.round(Math.max(0, closing_qty) * (p.purchase_price || 0));
 
       return {
         id: p.id,
@@ -846,64 +891,36 @@ router.get('/expense-by-category', async (req, res) => {
   }
 });
 
-// GET /api/reports/low-stock?threshold=5
+// GET /api/reports/low-stock[?threshold=5]
+// Live stock. Without a threshold each item is judged by its own low-stock alert (the same rule as Products and Home);
+// with one, every item is judged against that number.
 router.get('/low-stock', async (req, res) => {
-  const { threshold = 5 } = req.query;
+  const { threshold } = req.query;
   const businessId = req.user.businessId;
-  const fy         = req.financialYear;
-  const thresh     = parseFloat(threshold);
+  const thresh     = threshold === undefined || threshold === '' ? null : parseFloat(threshold);
 
   try {
     const products = await prisma.product.findMany({
-      where: { business_id: businessId, is_deleted: false, is_active: true },
+      where: { business_id: businessId, is_deleted: false, is_active: true, track_inventory: true },
       select: {
-        id: true, name: true, unit: true, purchase_price: true,
+        id: true, name: true, unit: true, purchase_price: true, stock_quantity: true, low_stock_alert: true,
         category: { select: { name: true } },
       },
       orderBy: { name: 'asc' },
     });
 
-    if (products.length === 0) {
-      return res.json({ products: [], threshold: thresh });
-    }
-
-    const productIds = products.map((p) => p.id);
-    const snapshot   = fy?.opening_stock_snapshot || {};
-    const invoiceWhere = {
-      business_id: businessId,
-      is_deleted:  false,
-      status:      { notIn: ['draft', 'cancelled'] },
-      ...(fy ? { financial_year_id: fy.id } : {}),
-    };
-
-    const [purchasedAgg, purchaseRetAgg, soldAgg, saleRetAgg] = await Promise.all([
-      prisma.invoiceItem.groupBy({ by: ['product_id'], where: { product_id: { in: productIds }, invoice: { ...invoiceWhere, voucher_type: 'PURCHASE' } }, _sum: { quantity: true } }),
-      prisma.invoiceItem.groupBy({ by: ['product_id'], where: { product_id: { in: productIds }, invoice: { ...invoiceWhere, voucher_type: 'PURCHASE_RETURN' } }, _sum: { quantity: true } }),
-      prisma.invoiceItem.groupBy({ by: ['product_id'], where: { product_id: { in: productIds }, invoice: { ...invoiceWhere, voucher_type: 'SALE' } }, _sum: { quantity: true } }),
-      prisma.invoiceItem.groupBy({ by: ['product_id'], where: { product_id: { in: productIds }, invoice: { ...invoiceWhere, voucher_type: 'SALE_RETURN' } }, _sum: { quantity: true } }),
-    ]);
-
-    const toMap = (agg) => Object.fromEntries(agg.map((r) => [r.product_id, r._sum.quantity || 0]));
-    const pMap = toMap(purchasedAgg);
-    const prMap = toMap(purchaseRetAgg);
-    const sMap = toMap(soldAgg);
-    const srMap = toMap(saleRetAgg);
-
     const result = products
-      .map((p) => {
-        const opening     = snapshot[p.id] ?? 0;
-        const closing_qty = opening + (pMap[p.id] || 0) - (prMap[p.id] || 0) - (sMap[p.id] || 0) + (srMap[p.id] || 0);
-        return {
-          id:            p.id,
-          name:          p.name,
-          category:      p.category?.name || '—',
-          unit:          p.unit,
-          closing_qty,
-          purchase_price: p.purchase_price || 0,
-          stock_value:   closing_qty * (p.purchase_price || 0),
-        };
-      })
-      .filter((p) => p.closing_qty <= thresh)
+      .filter((p) => (p.stock_quantity || 0) <= (thresh ?? p.low_stock_alert))
+      .map((p) => ({
+        id:             p.id,
+        name:           p.name,
+        category:       p.category?.name || '—',
+        unit:           p.unit,
+        closing_qty:    p.stock_quantity || 0,
+        low_stock_alert: p.low_stock_alert,
+        purchase_price: p.purchase_price || 0,
+        stock_value:    Math.round(Math.max(0, p.stock_quantity || 0) * (p.purchase_price || 0)),
+      }))
       .sort((a, b) => a.closing_qty - b.closing_qty);
 
     return res.json({ products: result, threshold: thresh });
@@ -1947,8 +1964,10 @@ router.get('/trial-balance', async (req, res) => {
     const purchases = taxableOf(purchase) - taxableOf(purchaseRet);
     const outputTax = g(sale, 'tax_amount') - g(saleRet, 'tax_amount');
     const inputTax = g(purchase, 'tax_amount') - g(purchaseRet, 'tax_amount');
-    const receivables = (g(sale, 'total_amount') - g(saleRet, 'total_amount')) - g(rec, 'amount');
-    const payables = (g(purchase, 'total_amount') - g(purchaseRet, 'total_amount')) - g(paid, 'amount');
+    // Receivable / payable are the party ledger balances (the same as the dashboard and Balance Sheet); the balances are as of today.
+    const owed = await ledgerBalances(businessId, req.financialYear);
+    const receivables = positiveTotal(owed.customers);
+    const payables = positiveTotal(owed.suppliers);
     const expenseTotal = g(exp, 'amount');
     const cash = g(rec, 'amount') - g(paid, 'amount') - expenseTotal;
 
@@ -1968,7 +1987,7 @@ router.get('/trial-balance', async (req, res) => {
     const total_cr = accounts.reduce((s, a) => s + a.cr, 0);
     res.json({
       accounts, total_dr, total_cr, balanced: total_dr === total_cr, difference: total_dr - total_cr,
-      notes: 'Derived from invoices, payments and expenses (no double-entry journal), so it excludes opening balances, stock and advances; a non-zero difference is expected in those cases.',
+      notes: 'Derived from invoices, payments and expenses (no double-entry journal). Receivable and payable are the party ledger balances (they include opening balances); stock is not included, so a non-zero difference is expected.',
     });
   } catch (err) {
     console.error('Trial balance error:', err);
