@@ -1880,16 +1880,18 @@ router.get('/gst-rate-report', async (req, res) => {
   const dateFilter = parseDateRange(from, to, req.financialYear);
   const baseInvoice = { business_id: businessId, is_deleted: false, status: { notIn: ['draft', 'cancelled'] }, ...fyFilter, ...dateFilter };
   try {
-    const [saleItems, purchaseItems] = await Promise.all([
-      prisma.invoiceItem.findMany({
-        where: { invoice: { ...baseInvoice, voucher_type: 'SALE' } },
-        select: { amount: true, tax_amount: true, tax_rate: true },
-      }),
-      prisma.invoiceItem.findMany({
-        where: { invoice: { ...baseInvoice, voucher_type: 'PURCHASE' } },
-        select: { amount: true, tax_amount: true, tax_rate: true },
-      }),
+    // Net of returns, like the GST Summary: a sale return reduces sales, a purchase return reduces purchases.
+    const pick = { amount: true, tax_amount: true, tax_rate: true, invoice: { select: { voucher_type: true } } };
+    const [saleRows, purchaseRows] = await Promise.all([
+      prisma.invoiceItem.findMany({ where: { invoice: { ...baseInvoice, voucher_type: { in: ['SALE', 'SALE_RETURN'] } } }, select: pick }),
+      prisma.invoiceItem.findMany({ where: { invoice: { ...baseInvoice, voucher_type: { in: ['PURCHASE', 'PURCHASE_RETURN'] } } }, select: pick }),
     ]);
+    const signed = (rows) => rows.map((r) => {
+      const k = r.invoice.voucher_type.endsWith('_RETURN') ? -1 : 1;
+      return { amount: k * r.amount, tax_amount: k * r.tax_amount, tax_rate: r.tax_rate };
+    });
+    const saleItems = signed(saleRows);
+    const purchaseItems = signed(purchaseRows);
 
     const slabMap = {};
     const ensureSlab = (rate) => {
